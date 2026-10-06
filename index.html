@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Job Dashboard</title>
+<meta name="description" content="業務と自社作業のタスクを毎日整理し、優先順位・フォロー・AIとの相談をまとめて行うダッシュボード">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+JP:wght@400;500;600&family=Zen+Kaku+Gothic+New:wght@500;700&display=swap">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<!--APP-START-->
+<div class="app">
+  <nav class="nav" aria-label="メイン">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Job Dashboard</span>
+    </div>
+    <div class="nav-items" id="nav"></div>
+    <p class="nav-foot" id="nav-foot"></p>
+  </nav>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-date" id="today-label"></div>
+      <form class="quick" id="quick-form" autocomplete="off">
+        <label class="visually-hidden" for="quick-input">タスクを追加</label>
+        <input id="quick-input" class="quick-input" type="text" placeholder="タスクを追加　例: 明日 規約レビュー !高 30分 @佐藤">
+        <label class="quick-pin"><input type="checkbox" id="quick-today"> 今日やる</label>
+        <button class="btn btn-primary" type="submit">追加</button>
+        <div class="quick-preview" id="quick-preview" aria-live="polite"></div>
+      </form>
+    </header>
+    <div id="banner"></div>
+    <main id="view" class="view" tabindex="-1"></main>
+  </div>
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="タスクの詳細"></aside>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<!--APP-END-->
+
+<script src="js/core.js"></script>
+<script src="js/store.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/ui.js"></script>
+</body>
+</html>
