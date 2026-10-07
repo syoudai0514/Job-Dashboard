@@ -2,6 +2,8 @@
 
 業務と自社作業のタスクを毎日整理して、「今日は何からやるか」を決め、止まっているものをフォローし、迷ったら AI と一緒に考えるためのダッシュボードです。
 
+設計の全体像は [docs/DESIGN.md](docs/DESIGN.md)（設計書）にまとめています。
+
 ビルド不要の静的サイト（HTML / CSS / JavaScript のみ）なので、GitHub Pages にそのまま置いて使えます。社内の GitHub Copilot で作り直すための叩き台として、構成・データ形式・ルールをこの README と [`.github/copilot-instructions.md`](.github/copilot-instructions.md) にまとめています。
 
 ## 1日の使い方
