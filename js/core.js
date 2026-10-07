@@ -45,15 +45,44 @@
     if (d <= 3) return { label: `${d}日後 ${Core.formatDate(due)}`, state: 'soon', days: d };
     return { label: Core.formatDate(due), state: 'later', days: d };
   };
+  Core.isWorkday = (iso) => { const w = Core.weekday(iso); return w !== 0 && w !== 6; };
+  /** from から to までの稼働日数（土日を除く。to が後なら正、前なら負） */
+  Core.workdayDiff = (to, from) => {
+    if (to === from) return 0;
+    const sign = to > from ? 1 : -1;
+    let n = 0;
+    let d = from;
+    for (let guard = 0; d !== to && guard < 4000; guard++) {
+      d = Core.addDays(d, sign);
+      if (Core.isWorkday(d)) n += sign;
+    }
+    return n;
+  };
+  /** iso から n 稼働日後（負なら前）の日付 */
+  Core.addWorkdays = (iso, n) => {
+    let d = iso;
+    let left = Math.abs(n);
+    const sign = n >= 0 ? 1 : -1;
+    while (left > 0) { d = Core.addDays(d, sign); if (Core.isWorkday(d)) left--; }
+    return d;
+  };
+  /** 今週の金曜（土日なら今日） */
+  Core.endOfWeek = (today) => {
+    const w = Core.weekday(today);
+    return w === 0 || w === 6 ? today : Core.addDays(today, 5 - w);
+  };
   Core.lastDayOfMonth = (iso) => {
     const d = Core.parseISO(iso);
     return Core.toISO(new Date(d.getFullYear(), d.getMonth() + 1, 0));
   };
 
   /* ---------- 区分・カテゴリ ---------- */
+  /** 大分類。WBS から新しい大分類を読み込むと Store が追加する */
   Core.AREAS = { work: '業務', own: '自社作業' };
   Core.STATUS = { todo: '未着手', doing: '進行中', waiting: '待ち', done: '完了' };
   Core.PRIORITY = { 1: '高', 2: '中', 3: '低' };
+  /** 難易度は 3=高 2=中 1=低（重要度と向きが逆なので注意） */
+  Core.DIFFICULTY = { 3: '高', 2: '中', 1: '低' };
   Core.DEFAULT_CATEGORIES = [
     { id: 'ai', area: 'work', name: '生成AI導入', keywords: ['生成AI', 'Copilot', 'ChatGPT', 'プロンプト', 'LLM', 'AI'] },
     { id: 'std', area: 'work', name: '標準化', keywords: ['標準化', '規約', 'テンプレ', '手順書', 'ガイドライン', 'ルール'] },
@@ -108,12 +137,18 @@
    */
   Core.parseQuickAdd = (text, today, categories) => {
     let t = ` ${String(text).replace(/　/g, ' ')} `;
-    const out = { title: '', due: null, priority: 2, categoryId: null, estimate: null, people: [], hints: [] };
+    const out = { title: '', due: null, priority: 2, difficulty: 2, interrupt: false, categoryId: null, estimate: null, people: [], hints: [] };
     const take = (m) => { t = t.replace(m[0], ' '); };
 
     const pr = t.match(/[!！](高|中|低|1|2|3)/);
     if (pr) { out.priority = { 高: 1, 1: 1, 中: 2, 2: 2, 低: 3, 3: 3 }[pr[1]]; take(pr); }
     else if (/至急|急ぎ|緊急/.test(t)) out.priority = 1;
+
+    const df = t.match(/難(?:易度)?[:：]?(高|中|低)/);
+    if (df) { out.difficulty = { 高: 3, 中: 2, 低: 1 }[df[1]]; take(df); }
+    const it = t.match(/[!！]突発|【突発】/);
+    if (it) { out.interrupt = true; take(it); }
+    else if (/突発|割り?込み/.test(t)) out.interrupt = true;
 
     const hc = t.match(/[#＃](\S+)/);
     if (hc) {
@@ -179,8 +214,9 @@
   /* ---------- 優先度スコア ----------
    * 高いほど今日やるべき。reasons は画面に「なぜ上位か」として表示する。
    */
-  Core.scoreTask = (task, today, settings) => {
+  Core.scoreTask = (task, today, settings, sched) => {
     if (task.status === 'done') return { score: -1, reasons: [] };
+    const sc = sched && sched.get ? sched.get(task.id) : null;
     const s = settings || {};
     let score = 0;
     const reasons = [];
@@ -198,6 +234,16 @@
     if (task.status === 'doing') { score += 10; reasons.push('進行中'); }
     if (task.status === 'waiting') score -= 40;
     if (task.recurringId && task.due === today) { score += 10; reasons.push('定例'); }
+    if (task.interrupt) { score += 25; reasons.push('突発'); }
+    if (sc) {
+      const overdue = task.due && Core.diffDays(task.due, today) < 0;
+      if (sc.float < 0 && !overdue) { score += 35; reasons.push('着手が遅れている'); }
+      else if (sc.float <= 2 && !overdue && (sc.duration >= 2 || sc.downstream) && Core.diffDays(task.due || today, today) > 1) {
+        score += 18; reasons.push(`着手期限まで余裕${sc.float}日`);
+      }
+      if (sc.downstream) { score += 5 * Math.min(sc.downstream, 4); reasons.push(`後続${sc.downstream}件`); }
+      if (sc.blockedBy.length) { score -= 25; reasons.push('先行タスク待ち'); }
+    }
     const last = (task.updatedAt || task.createdAt || today).slice(0, 10);
     const idle = Core.diffDays(today, last);
     if (idle >= (s.staleDays || 5) && task.status !== 'waiting') { score += 6; reasons.push(`${idle}日動きなし`); }
@@ -211,9 +257,10 @@
   Core.planToday = (tasks, today, settings) => {
     const capacity = (settings && settings.capacityMin) || 360;
     const open = tasks.filter((t) => t.status !== 'done');
+    const sched = Core.schedule ? Core.schedule(tasks, today, settings) : null;
     const scored = open
       .filter((t) => t.status !== 'waiting')
-      .map((t) => ({ task: t, ...Core.scoreTask(t, today, settings) }))
+      .map((t) => ({ task: t, ...Core.scoreTask(t, today, settings, sched) }))
       .sort((a, b) => {
         const pa = a.task.todayPin === today ? (a.task.todayOrder ?? 99) : 999;
         const pb = b.task.todayPin === today ? (b.task.todayOrder ?? 99) : 999;
@@ -224,7 +271,8 @@
     let minutes = 0;
     for (const item of scored) {
       const est = item.task.estimate || 30;
-      const must = item.task.todayPin === today || (item.task.due && Core.diffDays(item.task.due, today) <= 0);
+      const must = item.task.todayPin === today || (item.task.due && Core.diffDays(item.task.due, today) <= 0)
+        || (item.task.interrupt && item.task.status !== 'waiting');
       if (must || (minutes + est <= capacity && item.score >= 20)) {
         focus.push(item);
         minutes += est;
@@ -233,7 +281,7 @@
       }
     }
     const waiting = open.filter((t) => t.status === 'waiting');
-    return { focus, more: more.slice(0, 8), waiting, minutes, capacity };
+    return { focus, more: more.slice(0, 8), waiting, minutes, capacity, sched };
   };
 
   /* ---------- 定例タスク ---------- */
@@ -255,6 +303,30 @@
     if (r.freq === 'monthly') return Number(r.day) >= 31 ? '毎月末' : `毎月${r.day}日`;
     return '';
   };
+
+  /* ---------- 期限の山 ---------- */
+  /** 未完了タスクを 期限超過 / 今日 / 明日 / 今週(金曜まで) / 来週 に分ける */
+  Core.deadlineBuckets = (tasks, today) => {
+    const eow = Core.endOfWeek(today);
+    const eonw = Core.addDays(eow, 7);
+    const b = { overdue: [], today: [], tomorrow: [], week: [], nextWeek: [] };
+    for (const t of tasks) {
+      if (t.status === 'done' || !t.due) continue;
+      const d = Core.diffDays(t.due, today);
+      if (d < 0) b.overdue.push(t);
+      else if (d === 0) b.today.push(t);
+      else {
+        if (d === 1) b.tomorrow.push(t);
+        if (t.due <= eow) b.week.push(t);
+        else if (t.due <= eonw) b.nextWeek.push(t);
+      }
+    }
+    // 今週 = 今日〜金曜（今日・明日を含む）
+    b.week = [...b.today, ...b.week.filter((t) => !b.today.includes(t))];
+    Object.values(b).forEach((arr) => arr.sort((x, y) => x.due.localeCompare(y.due) || x.priority - y.priority));
+    return b;
+  };
+  Core.DEADLINE_LABELS = { overdue: '期限超過', today: '今日', tomorrow: '明日', week: '今週', nextWeek: '来週' };
 
   /* ---------- フォロー（声かけ）判定 ---------- */
   Core.followUps = (tasks, today, settings, categories) => {
@@ -321,6 +393,60 @@
       }
     }
 
+    // 期限の山（今日・今週）
+    const buckets = Core.deadlineBuckets(tasks, today);
+    if (buckets.today.length) {
+      push({
+        id: `duetoday:${today}:${buckets.today.length}`, level: 'warn',
+        title: `今日期限のタスクが${buckets.today.length}件残っています`,
+        detail: buckets.today.slice(0, 4).map((t) => `・${t.title}`).join('\n'),
+        actions: ['show-today'],
+      });
+    }
+    const weekTodo = buckets.week.filter((t) => t.status === 'todo');
+    if (buckets.week.length) {
+      push({
+        id: `dueweek:${today}:${buckets.week.length}`, level: weekTodo.length ? 'warn' : 'info',
+        title: `今週期限が${buckets.week.length}件（うち未着手${weekTodo.length}件）`,
+        detail: (weekTodo.length ? weekTodo : buckets.week).slice(0, 4).map((t) => `・${t.title}（${Core.formatDate(t.due)}）`).join('\n'),
+        actions: ['show-week'],
+      });
+    }
+
+    // 着手期限（期限から所要日数を逆算）と ボトルネック
+    if (Core.schedule) {
+      const sched = Core.schedule(tasks, today, s);
+      for (const t of open) {
+        const sc = sched.get(t.id);
+        const overdue = t.due && Core.diffDays(t.due, today) < 0;
+        if (!sc || overdue || !t.due || t.status === 'waiting') continue;
+        if (sc.float < 0) {
+          push({
+            id: `late:${t.id}:${t.due}`, level: 'critical', taskId: t.id,
+            title: `「${t.title}」はこのままだと期限（${Core.formatDate(t.due)}）に${-sc.float}日遅れる見込みです`,
+            detail: `残りの所要 ${sc.duration}日${t.difficulty === 3 ? '（難易度高で補正）' : ''}${sc.blockedBy.length ? `、先行「${sc.blockedBy.map((p) => p.title).join('」「')}」が未完了` : ''}。今日着手するか、期限・範囲の調整を相談しましょう。`,
+            actions: ['pin', 'ai-risk', 'open'],
+          });
+        } else if (t.status === 'todo' && sc.float <= (s.urgentFloat ?? 1) && Core.diffDays(t.due, today) > 1 && (sc.duration >= 2 || sc.downstream)) {
+          push({
+            id: `start:${t.id}:${t.due}`, level: 'warn', taskId: t.id,
+            title: `「${t.title}」は${sc.float === 0 ? '今日' : `${sc.float}日以内に`}着手しないと期限（${Core.formatDate(t.due)}）に間に合いません`,
+            detail: `所要 ${sc.duration}日${t.difficulty === 3 ? '（難易度高で補正）' : ''}から逆算した着手期限は ${Core.formatDate(sc.latestStart)} です。`,
+            actions: ['pin', 'breakdown'],
+          });
+        }
+      }
+      const bn = Core.bottlenecks(tasks, today, s, sched);
+      bn.items.filter((b) => b.sched.downstream >= 2).slice(0, 3).forEach((b) => {
+        push({
+          id: `bottleneck:${b.task.id}:${b.sched.downstream}`, level: 'warn', taskId: b.task.id,
+          title: `「${b.task.title}」がボトルネックになりそうです`,
+          detail: b.reasons.join('、'),
+          actions: ['open', 'pin', 'ai-risk'],
+        });
+      });
+    }
+
     const plan = Core.planToday(tasks, today, s);
     if (plan.minutes > plan.capacity) {
       push({
@@ -367,6 +493,14 @@
       重要度: Core.PRIORITY[t.priority], 期限: t.due || null, 見積分: t.estimate || null,
     };
     if (t.waitingFor) o.待ち相手 = t.waitingFor;
+    if (t.wbsId) o.WBS = t.wbsId;
+    if (t.l3) o.小分類 = t.l3;
+    if (t.difficulty) o.難易度 = Core.DIFFICULTY[t.difficulty];
+    if (t.interrupt) o.突発 = true;
+    if (t.start) o.開始予定 = t.start;
+    if (t.progress) o.進捗 = `${t.progress}%`;
+    if (t.owner) o.担当 = t.owner;
+    if ((t.deps || []).length) o.先行 = t.deps;
     if ((t.subtasks || []).length) o.サブタスク = t.subtasks.map((s) => (s.done ? '✓' : '・') + s.title);
     if (t.notes) o.メモ = t.notes.slice(0, 200);
     return o;
@@ -377,6 +511,7 @@
     breakdown: { label: 'タスク分解', desc: '大きい・止まっているタスクを30〜90分単位の手順に分ける' },
     extract: { label: 'メモからタスク化', desc: '議事録・チャット・メモを貼り付けてタスクを抜き出す' },
     consult: { label: '壁打ち', desc: '進め方や判断に迷っていることを一緒に考える' },
+    risk: { label: 'ボトルネック・リスク', desc: '遅れそうなタスクと後続を止めているタスクを渡して、打ち手と計画の引き直しを相談する' },
     review: { label: '週次振り返り', desc: '今週の実績から、良かった点・課題・来週の重点を整理する' },
   };
 
@@ -418,6 +553,16 @@
         + `${ctx.task ? `\n関連タスク:\n${JSON.stringify(Core.taskForPrompt(ctx.task, categories), null, 1)}\n` : ''}`
         + `\n参考: 現在の未完了タスク（${open.length}件）\n${JSON.stringify(open.slice(0, 30).map((t) => ({ title: t.title, 区分: catLabelOf(t, categories), 期限: t.due })), null, 0)}\n\n`
         + `新しくやるべきことが出てきた場合のみ、${JSON_RULE}\n{"tasks":[{"title":"","category":"区分","priority":2,"due":null,"estimate":30,"note":""}]}`;
+    } else if (mode === 'risk') {
+      const sched = Core.schedule(tasks, today, settings);
+      const bn = Core.bottlenecks(tasks, today, settings, sched);
+      const list = bn.items.slice(0, 12).map((b) => ({ ...Core.taskForPrompt(b.task, categories), 余裕日数: b.sched.float, 後続件数: b.sched.downstream, 指摘: b.reasons }));
+      user = `${head}WBS のボトルネックと遅延リスクを一緒に見てください。1日に1タスクへ割ける時間は約${(settings && settings.focusHours) || 3}時間、難易度高は所要を1.5倍で見積もっています。\n`
+        + `${ctx.text ? `補足: ${ctx.text}\n` : ''}`
+        + `打ち手（前倒し・分割・依頼・期限調整・やめる）を優先度順に提案し、期限を動かすべきものと、新たに必要なタスクを挙げてください。\n`
+        + `\nボトルネック候補:\n${JSON.stringify(list, null, 1)}\n`
+        + `\n担当別の負荷（直近5稼働日）:\n${JSON.stringify(bn.load.map((l) => ({ 担当: l.owner, 予定時間: l.hours, 容量: l.capacity, 負荷: `${l.pct}%` })), null, 0)}\n\n`
+        + `${JSON_RULE}\n{"order":[{"id":"今日着手すべきタスクID","reason":"理由"}],"defer":[{"id":"タスクID","newDue":"YYYY-MM-DD","reason":"理由"}],"tasks":[{"title":"新たに必要なタスク","category":"区分","priority":1,"due":"YYYY-MM-DD","estimate":30,"note":""}],"advice":"全体への助言"}`;
     } else if (mode === 'review') {
       const from = Core.addDays(today, -6);
       const done = tasks.filter((t) => t.completedAt && Core.diffDays(t.completedAt.slice(0, 10), from) >= 0);
@@ -479,7 +624,7 @@
         },
       };
     };
-    if (mode === 'plan') {
+    if (mode === 'plan' || mode === 'risk') {
       (data.order || []).forEach((o, i) => {
         const t = byId(o.id);
         if (t) out.push({ kind: 'pin', taskId: t.id, label: `${i + 1}. 今日やる: ${t.title}`, note: o.reason, payload: { order: i } });
@@ -490,6 +635,7 @@
           out.push({ kind: 'due', taskId: t.id, label: `期限変更: ${t.title} → ${Core.formatDate(o.newDue)}`, note: o.reason, payload: { due: o.newDue } });
         }
       });
+      if (mode === 'risk') (data.tasks || []).filter((x) => x && x.title).forEach((x) => out.push(newTask(x)));
     } else if (mode === 'breakdown') {
       const t = ctx.task && byId(ctx.task.id);
       if (t) {

@@ -5,7 +5,7 @@
  */
 (function (root) {
   'use strict';
-  const { Core, Store, AI } = root;
+  const { Core, Store, AI, WBS } = root;
   const $ = (sel, el) => (el || document).querySelector(sel);
 
   const ui = {
@@ -13,6 +13,10 @@
     today: Core.todayISO(),
     filters: { area: 'all', cat: 'all', status: 'open', q: '' },
     drawerTaskId: null,
+    deadline: null, // 今日ビューで開いている期限の山（overdue / today / tomorrow / week / nextWeek）
+    wbsCollapsed: new Set(),
+    wbsHideDone: false,
+    ctx: null, // 描画ごとに計算する { sched, bn, follows }
     confirmDelete: false,
     textPanel: null, // { title, text } ドロワーに文章を表示するとき
     ai: { mode: 'plan', taskId: '', text: '', prompt: null, response: '', proposals: null, prose: '', selected: {}, busy: false, error: '' },
@@ -59,16 +63,18 @@
         <button class="check" type="button" data-action="${t.status === 'done' ? 'undone' : 'complete'}" data-id="${t.id}" aria-label="${t.status === 'done' ? '未完了に戻す' : '完了にする'}"></button>
       </div>
       <button class="task-body" type="button" data-action="open" data-id="${t.id}">
-        <span class="task-title">${h(t.title)}</span>
+        <span class="task-title">${t.wbsId && !o.hideId ? `<span class="wbs-id">${h(t.wbsId)}</span>` : ''}${h(t.title)}</span>
         <span class="task-meta">
           ${t.priority === 1 ? '<span class="chip prio-1">重要</span>' : ''}
           ${o.hideCat ? '' : catChip(t.categoryId)}
           ${dueChip(t)}
           ${o.statusButton ? '' : statusChip(t, false)}
           ${t.recurringId ? '<span class="chip">定例</span>' : ''}
+          ${t.interrupt ? '<span class="chip chip-fire">突発</span>' : ''}
+          ${t.progress > 0 && t.status !== 'done' ? `<span class="est">${t.progress}%</span>` : ''}
           ${subs.length ? `<span class="est">${subDone}/${subs.length}</span>` : ''}
           ${t.estimate ? `<span class="est">${t.estimate}分</span>` : ''}
-          ${(o.reasons || []).filter((r) => /動きなし/.test(r)).map((r) => `<span class="chip reason">${h(r)}</span>`).join('')}
+          ${(o.reasons || []).filter((r) => /動きなし|着手|後続|先行/.test(r)).map((r) => `<span class="chip reason">${h(r)}</span>`).join('')}
         </span>
       </button>
       <div class="task-side">
@@ -86,6 +92,7 @@
       remind: 'リマインド文を作る', touch: '確認した（待ち継続）', resume: '進行中に戻す',
       breakdown: 'AIと分解する', open: '詳細を開く', 'ai-plan': 'AIと優先順位を相談',
       'add-in-category': 'タスクを追加', 'ai-consult': 'AIと考える',
+      'show-today': '今日期限を見る', 'show-week': '今週期限を見る', 'ai-risk': 'AIと打ち手を考える',
     };
     const actions = (compact ? f.actions.slice(0, 2) : f.actions)
       .map((a, i) => `<button class="btn btn-sm ${i === 0 ? 'btn-primary' : ''}" type="button" data-action="follow" data-follow="${h(f.id)}" data-kind="${a}" data-id="${t ? t.id : ''}" data-cat="${h(f.categoryId || '')}">${ACTION[a]}</button>`)
@@ -101,7 +108,8 @@
 
   /* ---------- ナビ ---------- */
   const VIEWS = [
-    ['today', '今日'], ['tasks', 'タスク'], ['follow', 'フォロー'], ['ai', 'AIと考える'], ['review', '振り返り'], ['settings', '設定'],
+    ['today', '今日'], ['wbs', 'WBS'], ['matrix', 'マトリクス'], ['tasks', 'タスク'], ['follow', 'フォロー'],
+    ['ai', 'AIと考える'], ['review', '振り返り'], ['settings', '設定'],
   ];
   function renderNav(follows) {
     const open = S().tasks.filter((t) => t.status !== 'done').length;
@@ -110,6 +118,10 @@
       let badge = '';
       if (id === 'follow' && follows.length) badge = `<span class="badge${urgent ? '' : ' soft'}">${urgent || follows.length}</span>`;
       if (id === 'tasks') badge = `<span class="badge soft">${open}</span>`;
+      if (id === 'wbs' && WBS) {
+        const dot = { connected: 'ok', syncing: 'ok', locked: 'warn', 'needs-permission': 'warn', error: 'crit' }[WBS.status];
+        if (dot) badge = `<span class="sync-dot ${dot}" title="Excel 同期: ${h(WBS_LABEL[WBS.status] || '')}"></span>`;
+      }
       return `<button class="nav-btn" type="button" data-action="nav" data-view="${id}" ${ui.view === id ? 'aria-current="page"' : ''}><span>${label}</span>${badge}</button>`;
     }).join('');
     $('#nav-foot').textContent = Store.storageOK
@@ -146,6 +158,7 @@
           <div class="capacity-bar"><span style="width:${pct}%"></span></div>
         </div>
       </div>
+      ${deadlineStrip()}
       <div class="grid-2">
         <div class="stack">
           <section class="panel focus-panel">
@@ -166,6 +179,7 @@
             <div class="section-head"><h2>フォロー</h2><button class="btn btn-sm btn-ghost" type="button" data-action="nav" data-view="follow">すべて見る（${follows.length}）</button></div>
             <div class="follow-list">${follows.length ? follows.slice(0, 3).map((f) => followCard(f, true)).join('') : '<p class="empty">気になる点はありません。いい調子です。</p>'}</div>
           </section>
+          ${bottleneckMini()}
           <section class="panel">
             <div class="section-head"><h2>回答待ち <span class="num muted">${plan.waiting.length}</span></h2></div>
             ${plan.waiting.length ? `<ul class="tasks">${plan.waiting.map((t) => taskRow(t)).join('')}</ul>` : '<p class="empty">待ちのタスクはありません。</p>'}
@@ -253,6 +267,7 @@
     if (a.mode === 'breakdown') inputs = taskSelect('分解するタスク', true) + textArea('補足（任意）', '例: 情シスのレビューが必要。来週の部会で説明したい');
     if (a.mode === 'extract') inputs = textArea('議事録・チャット・メモを貼り付け', '例: 定例の議事録、上司からのチャット、手書きメモの書き起こし', 8);
     if (a.mode === 'consult') inputs = textArea('相談したいこと', '例: Copilotの全社展開、まずどの部署から始めるのがいいか迷っている', 5) + taskSelect('関連するタスク（任意）', false);
+    if (a.mode === 'risk') inputs = `<p class="note">ボトルネック候補 <b class="num">${ui.ctx.bn.items.length}</b>件と担当別の負荷を渡します。</p>` + textArea('補足（任意）', '例: W-302 は外部ベンダー待ちの可能性あり。来週は研修で2日不在');
     if (a.mode === 'review') {
       const s = Core.completionStats(st.tasks, ui.today, st.categories, 7);
       inputs = `<p class="note">直近7日の完了 <b class="num">${s.total}</b>件、未完了 <b class="num">${open.length}</b>件、日々のメモをまとめて渡します。</p>`;
@@ -354,6 +369,250 @@
       </div>`;
   }
 
+  /* ---------- 期限の山 / ボトルネック（今日ビューの部品） ---------- */
+  function deadlineStrip() {
+    const b = Core.deadlineBuckets(S().tasks, ui.today);
+    const order = ['overdue', 'today', 'tomorrow', 'week', 'nextWeek'];
+    const btns = order.map((k) => `<button class="dl dl-${k}" type="button" data-action="deadline" data-bucket="${k}" aria-pressed="${ui.deadline === k}" ${b[k].length ? '' : 'data-empty="1"'}>
+        <span class="dl-label">${Core.DEADLINE_LABELS[k]}${k === 'week' ? `<small>〜${h(Core.formatDate(Core.endOfWeek(ui.today)))}</small>` : ''}</span><span class="dl-n num">${b[k].length}</span></button>`).join('');
+    const open = ui.deadline && b[ui.deadline];
+    return `<div class="deadlines" role="group" aria-label="期限の山">${btns}</div>
+      ${open ? `<section class="panel dl-panel"><div class="section-head"><h2>${Core.DEADLINE_LABELS[ui.deadline]}期限 <span class="num muted">${open.length}</span></h2>
+        <button class="btn btn-sm btn-ghost" type="button" data-action="deadline" data-bucket="${ui.deadline}">閉じる</button></div>
+        ${open.length ? `<ul class="tasks">${open.map((t) => taskRow(t)).join('')}</ul>` : '<p class="empty">該当するタスクはありません。</p>'}</section>` : ''}`;
+  }
+
+  function bottleneckMini() {
+    const items = ui.ctx.bn.items.slice(0, 3);
+    if (!items.length) return '';
+    return `<section class="panel">
+      <div class="section-head"><h2>ボトルネック注意</h2><button class="btn btn-sm btn-ghost" type="button" data-action="nav" data-view="matrix">詳しく</button></div>
+      <ul class="bn-mini">${items.map((b) => `<li><button type="button" data-action="open" data-id="${b.task.id}"><span class="bn-title">${h(b.task.title)}</span><span class="bn-why">${h(b.reasons[0] || '')}</span></button></li>`).join('')}</ul>
+    </section>`;
+  }
+
+  /* ---------- WBS ---------- */
+  const WBS_LABEL = {
+    disconnected: '未接続', 'needs-permission': '再接続が必要', syncing: '同期中', connected: '同期中（自動）',
+    locked: '書き込み待ち', error: 'エラー', manual: '手動同期',
+  };
+  function trendBadge(trend) {
+    const tr = Core.TREND[trend];
+    return `<span class="trend trend-${trend}" title="${tr.label}"><span aria-hidden="true">${tr.arrow}</span><span class="visually-hidden">${tr.label}</span></span>`;
+  }
+  function progressBar(pct, expected) {
+    return `<span class="pbar"><span class="pbar-fill" style="width:${pct}%"></span>${expected !== null && expected !== undefined ? `<span class="pbar-exp" style="left:${Math.min(100, expected)}%" title="今日時点の予定 ${expected}%"></span>` : ''}</span><span class="pct num">${pct}%</span>`;
+  }
+
+  function syncPanel() {
+    const meta = S().wbs || {};
+    const st = WBS ? WBS.status : 'manual';
+    const log = meta.log;
+    const fmt = (iso) => { if (!iso) return '—'; const d = new Date(iso); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+    const pill = { connected: 'ok', syncing: 'ok', locked: 'warn', 'needs-permission': 'warn', error: 'crit' }[st] || 'idle';
+    let buttons = '';
+    if (st === 'disconnected') buttons = '<button class="btn btn-primary" type="button" data-action="wbs-connect">Excel の WBS に接続</button><button class="btn" type="button" data-action="wbs-create">今のタスクから WBS を作成</button>';
+    else if (st === 'needs-permission') buttons = '<button class="btn btn-primary" type="button" data-action="wbs-reconnect">再接続する</button><button class="btn btn-ghost" type="button" data-action="wbs-disconnect">接続を解除</button>';
+    else if (st === 'manual') buttons = `<label class="btn btn-primary" for="wbs-file">Excel を読み込む</label><input type="file" id="wbs-file" accept=".xlsx" hidden>
+        ${WBS && WBS.manualBuffer ? '<button class="btn" type="button" data-action="wbs-export">Excel に書き出す</button>' : ''}
+        <button class="btn btn-ghost" type="button" data-action="wbs-create">今のタスクから WBS を作成</button>`;
+    else buttons = '<button class="btn" type="button" data-action="wbs-sync">今すぐ同期</button><button class="btn btn-ghost" type="button" data-action="wbs-disconnect">接続を解除</button>';
+    const n = (arr) => (arr ? arr.length : 0);
+    const list = (title, arr) => (n(arr) ? `<div><b>${title}（${n(arr)}）</b><ul>${arr.slice(0, 12).map((x) => `<li>${h(x)}</li>`).join('')}${n(arr) > 12 ? `<li>ほか${n(arr) - 12}件</li>` : ''}</ul></div>` : '');
+    return `<section class="panel sync-panel">
+      <div class="sync-row">
+        <div class="sync-info">
+          <span class="sync-pill ${pill}">${WBS_LABEL[st]}</span>
+          <span class="sync-file">${h((WBS && WBS.fileName) || meta.fileName || 'ファイル未選択')}</span>
+          <span class="muted">最終同期 ${fmt(meta.lastSync)}</span>
+        </div>
+        <div class="row">${buttons}</div>
+      </div>
+      ${WBS && WBS.message ? `<p class="note ${st === 'error' || st === 'locked' ? 'warn' : ''}">${h(WBS.message)}</p>` : ''}
+      ${st === 'disconnected' ? '<p class="muted sync-help">Excel の WBS ファイルを選ぶと、Excel で保存した変更を数秒で取り込み、ダッシュボードでの変更（状態・進捗など）を Excel に書き戻します。Excel で開いている間は書き込めないため、閉じたときにまとめて書き込みます。</p>' : ''}
+      ${st === 'manual' && !(WBS && WBS.message) ? '<p class="muted sync-help">このブラウザはファイルへの自動書き込みに対応していません（Edge / Chrome なら自動同期できます）。Excel を読み込んで取り込み、ダッシュボードの変更は「Excel に書き出す」で保存してください。</p>' : ''}
+      ${WBS && WBS.missing.length ? `<div class="note warn row between"><span>Excel から消えたタスクが ${WBS.missing.length} 件あります。</span><span class="row">
+          <button class="btn btn-sm btn-danger" type="button" data-action="wbs-missing" data-value="delete">ダッシュボードからも削除</button>
+          <button class="btn btn-sm" type="button" data-action="wbs-missing" data-value="keep">Excel に戻す</button></span></div>` : ''}
+      ${log ? `<details class="sync-log"><summary>前回の同期（${fmt(log.at)}・${h(log.reason || '')}）: 取り込み ${n(log.created) + n(log.toTask)}件 / Excel へ ${n(log.toExcel) + n(log.appended)}件${n(log.conflicts) ? ` / 競合 ${n(log.conflicts)}件` : ''}</summary>
+        <div class="sync-log-body">${list('Excel から追加', log.created)}${list('Excel の変更を反映', log.toTask)}${list('Excel に書き込み', log.toExcel)}${list('Excel に行を追加', log.appended)}${list('競合（両方で変更）', log.conflicts)}${list('書き込めなかったセル', log.skipped)}${list('ID の重複', log.duplicates)}${list('Excel に見当たらない', log.missing)}
+        ${!n(log.created) && !n(log.toTask) && !n(log.toExcel) && !n(log.appended) ? '<p class="muted">変更はありませんでした。</p>' : ''}</div></details>` : ''}
+    </section>`;
+  }
+
+  function viewWBS() {
+    const st = S();
+    const sched = ui.ctx.sched;
+    const bnIds = new Set(ui.ctx.bn.items.filter((b) => b.sched.downstream || b.sched.float < 0).map((b) => b.task.id));
+    // WBS に載るタスクだけ（定例・「WBS に載せない」は除く）
+    const tasks = st.tasks.filter((t) => !t.recurringId && !t.wbsSkip);
+    const tree = Core.wbsTree(tasks, st.categories, Core.AREAS);
+    // タイムライン: 今日の1週間前から6週間
+    const from = Core.addDays(ui.today, -7);
+    const days = 49;
+    const x = (iso) => Math.max(0, Math.min(100, (Core.diffDays(iso, from) / days) * 100));
+    const todayX = x(ui.today);
+    const ticks = [];
+    for (let i = 0; i <= days; i++) {
+      const d = Core.addDays(from, i);
+      if (Core.weekday(d) === 1) ticks.push(`<span class="tl-tick" style="left:${x(d)}%">${h(Core.formatDate(d).replace(/\(.\)/, ''))}</span>`);
+    }
+    const bar = (a, b, cls, prog) => {
+      if (!a && !b) return '';
+      const s0 = a || b; const e0 = b || a;
+      if (Core.diffDays(e0, from) < 0 || Core.diffDays(s0, Core.addDays(from, days)) > 0) return '';
+      const left = x(s0); const right = x(Core.addDays(e0, 1));
+      return `<span class="tl-bar ${cls}" style="left:${left}%;width:${Math.max(1.2, right - left)}%">${prog ? `<span class="tl-prog" style="width:${prog}%"></span>` : ''}</span>`;
+    };
+    const timeline = (inner) => `<div class="tl"><span class="tl-today" style="left:${todayX}%"></span>${inner}</div>`;
+
+    const rows = [];
+    const visible = (t) => !(ui.wbsHideDone && t.status === 'done');
+    const groupRow = (level, node) => {
+      const list = node.tasks.filter(visible);
+      if (!list.length && ui.wbsHideDone) return false;
+      const r = Core.rollup(node.tasks, ui.today, sched);
+      const collapsed = ui.wbsCollapsed.has(node.key);
+      const bnCount = node.tasks.filter((t) => bnIds.has(t.id)).length;
+      rows.push(`<div class="wrow lv${level}">
+        <div class="wcell wname"><button class="caret" type="button" data-action="wbs-toggle" data-key="${h(node.key)}" aria-expanded="${!collapsed}">${collapsed ? '▸' : '▾'}</button>
+          <span class="wtitle">${h(node.name)}</span>${bnCount ? `<span class="chip chip-bn" title="ボトルネック候補">要注意 ${bnCount}</span>` : ''}${r.overdue ? `<span class="chip due-overdue">超過 ${r.overdue}</span>` : ''}</div>
+        <div class="wcell wtrend">${r.total ? trendBadge(r.trend) : ''}</div>
+        <div class="wcell wprog">${r.total ? progressBar(r.actual, r.expected) : ''}</div>
+        <div class="wcell wcount num">${r.done}/${r.total}</div>
+        <div class="wcell wdue">${r.nextDue ? h(Core.formatDate(r.nextDue)) : '—'}</div>
+        <div class="wcell wtl">${timeline(bar(r.start, r.end, `grp trend-${r.trend}`, 0))}</div>
+      </div>`);
+      return !collapsed;
+    };
+    for (const l1 of tree) {
+      if (!groupRow(1, l1)) continue;
+      for (const l2 of l1.children) {
+        if (!l2.tasks.length) continue;
+        if (!groupRow(2, l2)) continue;
+        for (const l3 of l2.children) {
+          const showGroup = !(l3.name === '（小分類なし）' && l2.children.length === 1);
+          if (showGroup && !groupRow(3, l3)) continue;
+          for (const t of l3.tasks.filter(visible)) {
+            const sc = sched.get(t.id);
+            const overdue = t.status !== 'done' && t.due && Core.diffDays(t.due, ui.today) < 0;
+            const cls = t.status === 'done' ? 'done' : overdue || (sc && sc.float < 0) ? 'late' : sc && sc.float <= 1 ? 'tight' : 'ok';
+            const startD = t.start || (sc && sc.latestStart && t.due && sc.latestStart < t.due ? sc.latestStart : null);
+            rows.push(`<div class="wrow lv4 ${t.status === 'done' ? 'is-done' : ''}">
+              <div class="wcell wname"><span class="wbs-id">${h(t.wbsId || '—')}</span>
+                <button class="wtask" type="button" data-action="open" data-id="${t.id}">${h(t.title)}</button>
+                ${bnIds.has(t.id) ? '<span class="chip chip-bn">ボトルネック</span>' : ''}${sc && sc.blockedBy.length ? '<span class="chip reason">先行待ち</span>' : ''}${t.interrupt ? '<span class="chip chip-fire">突発</span>' : ''}${t.owner ? `<span class="chip">${h(t.owner)}</span>` : ''}</div>
+              <div class="wcell wtrend">${statusChip(t, true)}</div>
+              <div class="wcell wprog">${progressBar(t.status === 'done' ? 100 : t.progress || 0, null)}</div>
+              <div class="wcell wcount num">${t.estimate ? `${Math.round((t.estimate / 60) * 10) / 10}h` : ''}</div>
+              <div class="wcell wdue">${t.due ? `<span class="chip due-${t.status === 'done' ? 'later' : Core.dueInfo(t.due, ui.today).state}">${h(Core.formatDate(t.due))}</span>` : '—'}</div>
+              <div class="wcell wtl">${timeline(bar(startD, t.due, cls, t.status === 'done' ? 0 : t.progress))}</div>
+            </div>`);
+          }
+        }
+      }
+    }
+    return `
+      <div class="view-head"><div><h1>WBS</h1><p>大分類 → 中分類 → 小分類 → タスクの階層で、進捗と状況を矢印で表示します。</p></div></div>
+      ${syncPanel()}
+      <div class="wbs-tools">
+        <div class="legend">${['up', 'flat', 'down', 'done'].map((k) => `<span>${trendBadge(k)} ${Core.TREND[k].label}</span>`).join('')}
+          <span class="legend-note">矢印は「今日時点の予定進捗（縦線）」との差・期限超過・間に合わない見込みから判定</span></div>
+        <div class="row">
+          <label class="quick-pin"><input type="checkbox" id="wbs-hide-done" ${ui.wbsHideDone ? 'checked' : ''}> 完了を隠す</label>
+          <button class="btn btn-sm btn-ghost" type="button" data-action="wbs-expand" data-value="all">すべて開く</button>
+          <button class="btn btn-sm btn-ghost" type="button" data-action="wbs-expand" data-value="l2">中分類まで</button>
+        </div>
+      </div>
+      <div class="wbs-wrap">
+        <div class="wbs-table">
+          <div class="wrow whead">
+            <div class="wcell wname">分類・タスク</div><div class="wcell wtrend">状況</div><div class="wcell wprog">進捗</div>
+            <div class="wcell wcount">完了/件・工数</div><div class="wcell wdue">直近の期限</div>
+            <div class="wcell wtl"><div class="tl tl-head"><span class="tl-today" style="left:${todayX}%"></span>${ticks.join('')}</div></div>
+          </div>
+          ${rows.join('') || '<p class="empty" style="padding:16px">タスクがありません。</p>'}
+        </div>
+      </div>`;
+  }
+
+  /* ---------- 優先度マトリクス ---------- */
+  function matrixCard(item) {
+    const t = item.task;
+    const sc = item.sched;
+    const pips = [1, 2, 3].map((i) => `<i class="${i <= (t.difficulty || 2) ? 'on' : ''}"></i>`).join('');
+    return `<li class="mcard${item.early ? ' early' : ''}">
+      <button class="mcard-body" type="button" data-action="open" data-id="${t.id}">
+        <span class="mcard-title">${t.wbsId ? `<span class="wbs-id">${h(t.wbsId)}</span>` : ''}${h(t.title)}</span>
+        <span class="task-meta">
+          ${item.early ? '<span class="chip chip-early">早めに着手</span>' : ''}
+          ${item.reasons.map((r) => `<span class="chip ${/超過|遅れ/.test(r) ? 'due-overdue' : /突発/.test(r) ? 'chip-fire' : 'due-soon'}">${h(r)}</span>`).join('')}
+          ${t.due && !item.reasons.some((r) => /期限|超過/.test(r)) ? `<span class="chip">${h(Core.formatDate(t.due))}</span>` : ''}
+          <span class="pips" title="難易度 ${Core.DIFFICULTY[t.difficulty || 2]}">難${pips}</span>
+          ${sc && Number.isFinite(sc.float) && sc.float >= 0 ? `<span class="est">余裕${sc.float}日</span>` : ''}
+          ${sc && sc.downstream ? `<span class="est">後続${sc.downstream}</span>` : ''}
+        </span>
+      </button>
+      <button class="pin-btn" type="button" data-action="toggle-pin" data-id="${t.id}" aria-pressed="${t.todayPin === ui.today}">今日</button>
+    </li>`;
+  }
+
+  function viewMatrix() {
+    const st = S();
+    const axis = st.settings.matrixAxis || 'both';
+    const m = Core.matrix(st.tasks, ui.today, st.settings, axis, ui.ctx.sched);
+    const quad = (k) => {
+      const q = Core.QUADRANTS[k];
+      return `<section class="quad quad-${k}">
+        <header><span class="quad-name">${q.name}</span><span class="quad-tag">${q.tag}</span><b class="quad-action">${q.action}</b><span class="num muted">${m[k].length}</span></header>
+        <p class="quad-desc">${q.desc}</p>
+        ${m[k].length ? `<ul class="mlist">${m[k].map(matrixCard).join('')}</ul>` : '<p class="empty">なし</p>'}
+      </section>`;
+    };
+    const bn = ui.ctx.bn;
+    const maxScore = Math.max(1, ...bn.items.map((b) => b.score));
+    return `
+      <div class="view-head"><div><h1>優先度マトリクス</h1><p>縦軸が緊急度、横軸が重要度・難易度です。緊急度は期限ではなく、残りの所要日数から逆算した「着手期限」で判定します。</p></div>
+        <div class="row"><span class="label">横軸</span><div class="seg" role="group" aria-label="横軸">
+          <button type="button" data-action="matrix-axis" data-value="both" aria-pressed="${axis === 'both'}">重要度＋難易度</button>
+          <button type="button" data-action="matrix-axis" data-value="importance" aria-pressed="${axis === 'importance'}">重要度のみ</button></div></div></div>
+      <div class="matrix">
+        <div class="axis-y"><span>緊急</span></div>${quad('q3')}${quad('q1')}
+        <div class="axis-y"><span>緊急でない</span></div>${quad('q4')}${quad('q2')}
+        <div></div><div class="axis-x">← 重要度・難易度 低</div><div class="axis-x right">重要度・難易度 高 →</div>
+      </div>
+
+      <div class="grid-2" style="margin-top:24px">
+        <section class="panel">
+          <div class="section-head"><h2>ボトルネック候補 <span class="num muted">${bn.items.length}</span></h2>
+            <button class="btn btn-sm" type="button" data-action="goto-ai" data-mode="risk">AIと打ち手を考える</button></div>
+          ${bn.items.length ? `<ol class="bn-list">${bn.items.slice(0, 10).map((b) => `<li>
+              <div class="bn-head"><button class="wtask" type="button" data-action="open" data-id="${b.task.id}">${b.task.wbsId ? `<span class="wbs-id">${h(b.task.wbsId)}</span>` : ''}${h(b.task.title)}</button>
+                <span class="bn-score"><span style="width:${(b.score / maxScore) * 100}%"></span></span></div>
+              <ul class="bn-reasons">${b.reasons.map((r) => `<li>${h(r)}</li>`).join('')}</ul></li>`).join('')}</ol>`
+            : '<p class="empty">目立ったボトルネックはありません。</p>'}
+        </section>
+        <div class="stack">
+          <section class="panel">
+            <div class="section-head"><h2>担当別の負荷</h2><span class="muted">直近5稼働日・容量 ${bn.capacity}h</span></div>
+            ${bn.load.length ? `<div class="bars">${bn.load.map((l) => `<div class="bar-row"><span class="name">${h(l.owner)}</span>
+              <span class="bar-track"><span class="bar-fill ${l.pct > 100 ? 'over' : 'area-work'}" style="width:${Math.min(100, l.pct)}%;display:block"></span></span><span class="n">${l.pct}%</span></div>`).join('')}</div>`
+              : '<p class="empty">直近5日に予定された作業はありません。</p>'}
+            <p class="muted" style="font-size:.78rem;margin-top:8px">担当が空欄のタスクは「${h(st.settings.myName || '自分')}」として数えます。</p>
+          </section>
+          <details class="panel method">
+            <summary><h2 style="display:inline">この表の考え方</h2></summary>
+            <div class="method-body">
+              <p><b>時間管理のマトリクス（アイゼンハワー・マトリクス）</b> — 『7つの習慣』で知られる、緊急度と重要度で仕事を4つの領域に分ける方法です。成果につながるのは第2領域（緊急ではないが重要）に先手で時間を使うことで、そうすると第1領域の火消しが減ります。</p>
+              <p><b>緊急度は「着手期限」で見る</b> — 着手期限 = 期限 − 残りの所要日数。所要日数 = 見積 ×（1 − 進捗）× 難易度係数（低1.0 / 中1.2 / 高1.5）÷ 1日にそのタスクへ割ける時間（${st.settings.focusHours || 3}時間）。先行・後続がある場合は、後続の着手期限から逆算します（クリティカルパス法）。余裕が${st.settings.urgentFloat ?? 1}日以下になると緊急側に移ります。</p>
+              <p><b>早めに着手</b> — 第2領域のうち、難易度が高い・所要3日以上で余裕が${st.settings.earlyStartFloat ?? 10}日以内のもの。「一番重いカエルを朝一番に食べる（Eat the frog）」の考え方で、最初の一歩だけでも今週中に。</p>
+              <p><b>ボトルネック</b> — 制約理論（TOC）では、全体の速さは一番細いところで決まると考えます。後続を止めているタスク、余裕がマイナスのタスク、担当が過負荷のタスクを上に出しています。</p>
+            </div>
+          </details>
+        </div>
+      </div>`;
+  }
+
   /* ---------- 設定 ---------- */
   function viewSettings() {
     const st = S();
@@ -368,8 +627,20 @@
             <label class="field"><span>1日の作業容量（分）</span><input class="input num" type="number" min="60" step="30" id="set-capacity" data-setting="capacityMin" value="${s.capacityMin}"></label>
             <label class="field"><span>停滞とみなす日数</span><input class="input num" type="number" min="1" id="set-stale" data-setting="staleDays" value="${s.staleDays}"></label>
             <label class="field"><span>待ちをフォローする日数</span><input class="input num" type="number" min="1" id="set-waiting" data-setting="waitingDays" value="${s.waitingDays}"></label>
+            <label class="field"><span>1タスクに1日で割ける時間（h）</span><input class="input num" type="number" min="1" max="8" id="set-focus" data-setting="focusHours" value="${s.focusHours}"></label>
+            <label class="field"><span>緊急とみなす余裕日数</span><input class="input num" type="number" min="0" id="set-urgent" data-setting="urgentFloat" value="${s.urgentFloat}"></label>
+            <label class="field"><span>早期着手を勧める余裕日数</span><input class="input num" type="number" min="1" id="set-early" data-setting="earlyStartFloat" value="${s.earlyStartFloat}"></label>
+            <label class="field"><span>自分の名前（担当欄）</span><input class="input" id="set-myname" data-setting-text="myName" value="${h(s.myName)}" placeholder="空欄なら「自分」"></label>
           </div>
-          <p class="muted" style="font-size:.8rem">容量は会議を除いた、実際に手を動かせる時間の目安です。</p>
+          <p class="muted" style="font-size:.8rem">容量は会議を除いた、実際に手を動かせる時間の目安です。所要日数 = 見積 ×（1 − 進捗）× 難易度係数 ÷「1タスクに1日で割ける時間」で計算し、期限から逆算して着手期限を出します。</p>
+        </section>
+
+        <section class="panel stack" style="gap:12px"><h2>WBS（Excel）同期</h2>
+          <div class="settings-grid">
+            <label class="quick-pin"><input type="checkbox" id="set-wbs-append" data-wbs-setting="appendNew" ${s.wbs.appendNew ? 'checked' : ''}> ダッシュボードで追加したタスクも WBS に行を追加する</label>
+            <label class="field"><span>Excel の変更を確認する間隔（秒）</span><input class="input num" type="number" min="2" id="set-wbs-poll" data-wbs-setting="pollSec" value="${s.wbs.pollSec}"></label>
+          </div>
+          <p class="muted" style="font-size:.8rem">定例作業と、詳細で「WBS に載せない」にしたタスクは同期しません。接続・解除は WBS 画面で行います。</p>
         </section>
 
         <section class="panel stack" style="gap:12px"><div class="row between"><h2>区分</h2><button class="btn btn-sm" type="button" data-action="cat-add">＋ 区分を追加</button></div>
@@ -437,6 +708,20 @@
   }
 
   /* ---------- ドロワー（タスク詳細） ---------- */
+  function scheduleInfo(t) {
+    if (t.status === 'done') return '';
+    const sc = Core.schedule(S().tasks, ui.today, S().settings).get(t.id);
+    if (!sc) return '';
+    const items = [`所要 <b class="num">${sc.duration}</b>日`];
+    if (sc.latestStart) items.push(`着手期限 <b>${h(Core.formatDate(sc.latestStart))}</b>`);
+    if (Number.isFinite(sc.float)) items.push(`余裕 <b class="num ${sc.float < 0 ? 'neg' : ''}">${sc.float}</b>日`);
+    if (sc.downstream) items.push(`後続 <b class="num">${sc.downstream}</b>件`);
+    const blocked = sc.blockedBy.length ? `<div>先行が未完了: ${sc.blockedBy.map((p) => `<button class="link" type="button" data-action="open" data-id="${p.id}">${h(p.wbsId || '')} ${h(p.title)}</button>`).join('、')}</div>` : '';
+    const succ = sc.succs.filter((c) => c.status !== 'done');
+    const next = succ.length ? `<div>このタスクを待っている: ${succ.map((c) => `<button class="link" type="button" data-action="open" data-id="${c.id}">${h(c.wbsId || '')} ${h(c.title)}</button>`).join('、')}</div>` : '';
+    return `<div class="sched-box ${sc.float < 0 ? 'late' : sc.float <= 2 ? 'tight' : ''}"><div class="row">${items.join('<span class="muted">・</span>')}</div>${blocked}${next}</div>`;
+  }
+
   function renderDrawer() {
     const el = $('#drawer');
     const scrim = $('#scrim');
@@ -450,19 +735,25 @@
     const t = ui.drawerTaskId && Store.task(ui.drawerTaskId);
     if (!t) { el.hidden = true; scrim.hidden = true; el.innerHTML = ''; return; }
     const pinned = t.todayPin === ui.today;
-    const segBtns = (field, map) => Object.entries(map).map(([k, v]) => `<button type="button" data-action="set-field" data-field="${field}" data-value="${k}" aria-pressed="${String(t[field]) === k}">${v}</button>`).join('');
+    const segBtns = (field, map) => (Array.isArray(map) ? map : Object.entries(map)).map(([k, v]) => `<button type="button" data-action="set-field" data-field="${field}" data-value="${k}" aria-pressed="${String(t[field]) === k}">${v}</button>`).join('');
     const catOptions = Object.entries(Core.AREAS).map(([area, label]) => `<optgroup label="${label}">${cats().filter((c) => c.area === area).map((c) => `<option value="${c.id}" ${t.categoryId === c.id ? 'selected' : ''}>${h(c.name)}</option>`).join('')}</optgroup>`).join('');
     const fri = nextFriday();
     el.innerHTML = `
-      <div class="drawer-head"><span class="label">タスク${t.recurringId ? '・定例' : ''}</span><button class="btn btn-ghost" type="button" data-action="close">閉じる</button></div>
+      <div class="drawer-head"><span class="label">${t.wbsId ? `<span class="wbs-id">${h(t.wbsId)}</span>` : ''}${t.recurringId ? '定例タスク' : t.wbsSkip ? 'WBS 対象外' : 'WBS のタスク'}</span><button class="btn btn-ghost" type="button" data-action="close">閉じる</button></div>
       <label class="visually-hidden" for="d-title">タスク名</label>
       <textarea class="textarea title-input" id="d-title" rows="2" data-field="title">${h(t.title)}</textarea>
       <div class="drawer-grid">
         <label class="field"><span>区分</span><select class="select" id="d-cat" data-field="categoryId"><option value="">未分類</option>${catOptions}</select></label>
         <div class="field"><span>今日の計画</span><button class="pin-btn" style="padding:8px 12px;font-size:.85rem" type="button" data-action="toggle-pin" data-id="${t.id}" aria-pressed="${pinned}">${pinned ? '今日やる（解除）' : '今日やるに入れる'}</button></div>
         <div class="field wide"><span>状態</span><div class="seg" role="group">${segBtns('status', Core.STATUS)}</div></div>
+        <label class="field wide"><span>小分類</span><input class="input" id="d-l3" data-field="l3" value="${h(t.l3)}" list="d-l3-list" placeholder="例: ガイドライン整備">
+          <datalist id="d-l3-list">${[...new Set(S().tasks.filter((x) => x.categoryId === t.categoryId && x.l3).map((x) => x.l3))].map((v) => `<option value="${h(v)}">`).join('')}</datalist></label>
         <div class="field"><span>重要度</span><div class="seg" role="group">${segBtns('priority', Core.PRIORITY)}</div></div>
+        <div class="field"><span>難易度</span><div class="seg" role="group">${segBtns('difficulty', [['3', '高'], ['2', '中'], ['1', '低']])}</div></div>
         <label class="field"><span>見積（分）</span><input class="input num" id="d-est" type="number" min="5" step="5" data-field="estimate" value="${t.estimate || ''}"></label>
+        <label class="field"><span>進捗 <b class="num" id="d-prog-val">${t.status === 'done' ? 100 : t.progress || 0}%</b></span><input type="range" id="d-prog" min="0" max="100" step="10" data-field="progress" value="${t.status === 'done' ? 100 : t.progress || 0}"></label>
+        <label class="field"><span>開始予定</span><input class="input num" id="d-start" type="date" data-field="start" value="${t.start || ''}"></label>
+        <label class="field"><span>担当</span><input class="input" id="d-owner" data-field="owner" value="${h(t.owner)}" placeholder="空欄なら自分"></label>
         <div class="field wide"><span>期限</span><div class="row">
           <input class="input num" id="d-due" type="date" data-field="due" value="${t.due || ''}" style="width:auto">
           <button class="btn btn-sm" type="button" data-action="set-due" data-value="${ui.today}">今日</button>
@@ -471,7 +762,14 @@
           <button class="btn btn-sm" type="button" data-action="set-due" data-value="${Core.addDays(ui.today, 7)}">1週間後</button>
           ${t.due ? '<button class="btn btn-sm btn-ghost" type="button" data-action="set-due" data-value="">なし</button>' : ''}</div></div>
         <label class="field wide"><span>待ち相手・関係者</span><input class="input" id="d-wait" data-field="waitingFor" value="${h(t.waitingFor)}" placeholder="例: 佐藤"></label>
+        <label class="field wide"><span>先行タスク（先に終わっている必要があるタスクの ID）</span><input class="input" id="d-deps" data-field="deps" value="${h((t.deps || []).join(', '))}" placeholder="例: W-101, W-102" list="d-deps-list">
+          <datalist id="d-deps-list">${S().tasks.filter((x) => x.wbsId && x.id !== t.id && x.status !== 'done').map((x) => `<option value="${h(x.wbsId)}">${h(x.title)}</option>`).join('')}</datalist></label>
+        <div class="wide row">
+          <label class="quick-pin"><input type="checkbox" id="d-interrupt" data-field="interrupt" ${t.interrupt ? 'checked' : ''}> 突発作業</label>
+          ${t.recurringId ? '' : `<label class="quick-pin"><input type="checkbox" id="d-skip" data-field="wbsSkip" ${t.wbsSkip ? 'checked' : ''}> WBS に載せない</label>`}
+        </div>
       </div>
+      ${scheduleInfo(t)}
       <div class="field"><span>手順・サブタスク</span>
         <ul class="sub-list">${(t.subtasks || []).map((s) => `<li class="${s.done ? 'done' : ''}"><input type="checkbox" data-action="sub-toggle" data-sub="${s.id}" ${s.done ? 'checked' : ''} aria-label="完了"><span>${h(s.title)}</span><button class="x" type="button" data-action="sub-del" data-sub="${s.id}" aria-label="削除">×</button></li>`).join('')}</ul>
         <form class="row" data-form="sub-add"><input class="input" id="d-sub" placeholder="手順を追加して Enter" style="flex:1"><button class="btn btn-sm" type="submit">追加</button></form>
@@ -533,13 +831,15 @@
   function render() {
     const st = S();
     const follows = Core.followUps(st.tasks, ui.today, st.settings, st.categories);
+    const sched = Core.schedule(st.tasks, ui.today, st.settings);
+    ui.ctx = { follows, sched, bn: Core.bottlenecks(st.tasks, ui.today, st.settings, sched) };
     renderNav(follows);
     renderBanner();
     const view = $('#view');
     const scroll = window.scrollY;
     const html = {
       today: () => viewToday(follows), tasks: viewTasks, follow: () => viewFollow(follows),
-      ai: viewAI, review: viewReview, settings: viewSettings,
+      ai: viewAI, review: viewReview, settings: viewSettings, wbs: viewWBS, matrix: viewMatrix,
     }[ui.view] || (() => viewToday(follows));
     view.innerHTML = html();
     window.scrollTo(0, scroll);
@@ -648,6 +948,8 @@
     if (kind === 'breakdown' && t) gotoAI('breakdown', id);
     if (kind === 'open' && t) openDrawer(id);
     if (kind === 'ai-plan') gotoAI('plan');
+    if (kind === 'ai-risk') gotoAI('risk');
+    if (kind === 'show-today' || kind === 'show-week') { ui.deadline = kind === 'show-today' ? 'today' : 'week'; setView('today'); }
     if (kind === 'add-in-category') prefillQuick(catId);
     if (kind === 'ai-consult') {
       const c = Store.category(catId);
@@ -681,6 +983,8 @@
       catChip(p.categoryId),
       p.due ? `<span class="chip due-${Core.dueInfo(p.due, ui.today).state}">期限 ${h(Core.formatDate(p.due))}</span>` : '<span class="chip">期限なし</span>',
       `<span class="chip ${p.priority === 1 ? 'prio-1' : ''}">重要度 ${Core.PRIORITY[p.priority]}</span>`,
+      p.difficulty !== 2 ? `<span class="chip">難易度 ${Core.DIFFICULTY[p.difficulty]}</span>` : '',
+      p.interrupt ? '<span class="chip chip-fire">突発</span>' : '',
       p.estimate ? `<span class="chip">${p.estimate}分</span>` : '',
       p.people.length ? `<span class="chip">関係者 ${h(p.people.join('・'))}</span>` : '',
     ].join('');
@@ -693,6 +997,7 @@
     const pin = $('#quick-today').checked;
     const t = Store.addTask({
       title: p.title, categoryId: p.categoryId, priority: p.priority, due: p.due, estimate: p.estimate,
+      difficulty: p.difficulty, interrupt: p.interrupt, wbsSkip: !S().settings.wbs.appendNew,
       waitingFor: p.people.join('・'), todayPin: pin ? ui.today : null,
     });
     input.value = ''; ui.quickCat = null;
@@ -710,6 +1015,29 @@
     const tid = ui.drawerTaskId;
     switch (action) {
       case 'nav': closeDrawer(); setView(btn.dataset.view); break;
+      case 'deadline': ui.deadline = ui.deadline === btn.dataset.bucket ? null : btn.dataset.bucket; render(); break;
+      case 'matrix-axis': Store.updateSettings({ matrixAxis: btn.dataset.value }); break;
+      case 'wbs-connect': WBS.connect(); break;
+      case 'wbs-reconnect': WBS.reconnect(); break;
+      case 'wbs-sync': WBS.syncNow(); break;
+      case 'wbs-disconnect': WBS.disconnect(); break;
+      case 'wbs-create': WBS.createNew(); break;
+      case 'wbs-export': WBS.exportFile(); break;
+      case 'wbs-missing': WBS.resolveMissing(btn.dataset.value); break;
+      case 'wbs-toggle': {
+        const k = btn.dataset.key;
+        if (ui.wbsCollapsed.has(k)) ui.wbsCollapsed.delete(k); else ui.wbsCollapsed.add(k);
+        render();
+        break;
+      }
+      case 'wbs-expand': {
+        ui.wbsCollapsed = new Set();
+        if (btn.dataset.value === 'l2') {
+          Core.wbsTree(S().tasks, cats(), Core.AREAS).forEach((l1) => l1.children.forEach((l2) => ui.wbsCollapsed.add(l2.key)));
+        }
+        render();
+        break;
+      }
       case 'open': openDrawer(id); break;
       case 'close': closeDrawer(); break;
       case 'complete': completeTask(id); break;
@@ -728,7 +1056,7 @@
       }
       case 'set-field': {
         const { field, value } = btn.dataset;
-        const val = field === 'priority' ? Number(value) : value;
+        const val = field === 'priority' || field === 'difficulty' ? Number(value) : value;
         Store.updateTask(tid, { [field]: val }, field === 'status' ? `状態を「${Core.STATUS[val]}」に変更` : null);
         renderDrawer();
         break;
@@ -795,17 +1123,30 @@
     const el = e.target;
     const tid = ui.drawerTaskId;
     if (el.closest('#drawer') && el.dataset.field && tid) {
-      let v = el.value;
-      if (el.dataset.field === 'estimate') v = v ? Number(v) : null;
-      if (el.dataset.field === 'due' || el.dataset.field === 'categoryId') v = v || null;
-      if (el.dataset.field === 'title') v = v.trim() || Store.task(tid).title;
-      Store.updateTask(tid, { [el.dataset.field]: v });
+      const f = el.dataset.field;
+      let v = el.type === 'checkbox' ? el.checked : el.value;
+      if (f === 'estimate') v = v ? Number(v) : null;
+      if (f === 'progress') v = Number(v) || 0;
+      if (['due', 'start', 'categoryId'].includes(f)) v = v || null;
+      if (f === 'title') v = v.trim() || Store.task(tid).title;
+      if (f === 'deps') v = v.split(/[,、，\s]+/).map((x) => x.trim()).filter(Boolean);
+      if (['l3', 'owner', 'waitingFor'].includes(f)) v = v.trim();
+      Store.updateTask(tid, { [f]: v }, f === 'progress' ? `進捗を${v}%に更新` : null);
+      if (['progress', 'deps', 'start', 'interrupt', 'wbsSkip', 'due', 'estimate'].includes(f)) renderDrawer();
+      return;
+    }
+    if (el.id === 'wbs-hide-done') { ui.wbsHideDone = el.checked; render(); return; }
+    if (el.id === 'wbs-file' && el.files[0]) { WBS.importFile(el.files[0]); return; }
+    if (el.dataset.settingText !== undefined) { Store.updateSettings({ [el.dataset.settingText]: el.value.trim() }); return; }
+    if (el.dataset.wbsSetting) {
+      const k = el.dataset.wbsSetting;
+      Store.updateSettings({ wbs: { ...S().settings.wbs, [k]: el.type === 'checkbox' ? el.checked : Math.max(2, Number(el.value) || 5) } });
       return;
     }
     if (el.dataset.journal) { Store.setJournal(ui.today, el.dataset.journal, el.value); return; }
     if (el.dataset.filter) { ui.filters[el.dataset.filter] = el.value; render(); return; }
     if (el.dataset.ai) { ui.ai[el.dataset.ai] = el.value; return; }
-    if (el.dataset.setting) { Store.updateSettings({ [el.dataset.setting]: Math.max(1, Number(el.value) || 1) }); return; }
+    if (el.dataset.setting) { Store.updateSettings({ [el.dataset.setting]: Math.max(0, Number(el.value) || 0) }); return; }
     if (el.dataset.aiSetting) { Store.updateSettings({ ai: { ...S().settings.ai, [el.dataset.aiSetting]: el.value.trim() } }); return; }
     if (el.dataset.catId) {
       const v = el.dataset.field === 'keywords' ? el.value.split(/[、,，\s]+/).map((s) => s.trim()).filter(Boolean) : el.value;
@@ -833,6 +1174,7 @@
   document.addEventListener('input', (e) => {
     const el = e.target;
     if (el.id === 'quick-input') updateQuickPreview();
+    if (el.id === 'd-prog') { const out = $('#d-prog-val'); if (out) out.textContent = `${el.value}%`; }
     if (el.dataset.ai) ui.ai[el.dataset.ai] = el.value;
     if (el.id === 'filter-q') {
       ui.filters.q = el.value;
@@ -870,7 +1212,18 @@
     Store.ensureRoutines(ui.today);
     render();
   }
-  Store.onChange(() => render());
+  // 同期など画面の外から来た変更は、入力中なら入力が終わるまで描画を待つ
+  function softRender() {
+    const a = document.activeElement;
+    if (a && a !== document.body && /INPUT|TEXTAREA|SELECT/.test(a.tagName) && (a.closest('#view') || a.closest('#drawer'))) { ui.renderPending = true; return; }
+    render();
+    if (ui.drawerTaskId) renderDrawer();
+  }
+  document.addEventListener('focusout', () => {
+    if (ui.renderPending) setTimeout(() => { if (ui.renderPending) { ui.renderPending = false; softRender(); } }, 50);
+  });
+  Store.onChange((st, meta) => ((meta && /^wbs/.test(meta.source || '')) ? softRender() : render()));
+  if (WBS) { WBS.onChange(softRender); WBS.boot(); }
   // 日付が変わったら（翌朝タブを開いたままでも）定例生成と再計算
   setInterval(() => { if (Core.todayISO() !== ui.today) boot(); }, 60000);
   boot();

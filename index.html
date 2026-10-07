@@ -27,7 +27,7 @@
       <div class="topbar-date" id="today-label"></div>
       <form class="quick" id="quick-form" autocomplete="off">
         <label class="visually-hidden" for="quick-input">タスクを追加</label>
-        <input id="quick-input" class="quick-input" type="text" placeholder="タスクを追加　例: 明日 規約レビュー !高 30分 @佐藤">
+        <input id="quick-input" class="quick-input" type="text" placeholder="タスクを追加　例: 明日 規約レビュー !高 難:高 3h @佐藤">
         <label class="quick-pin"><input type="checkbox" id="quick-today"> 今日やる</label>
         <button class="btn btn-primary" type="submit">追加</button>
         <div class="quick-preview" id="quick-preview" aria-live="polite"></div>
@@ -44,8 +44,12 @@
 <!--APP-END-->
 
 <script src="js/core.js"></script>
+<script src="js/schedule.js"></script>
+<script src="js/wbs-core.js"></script>
 <script src="js/store.js"></script>
 <script src="js/ai.js"></script>
+<script src="js/vendor/exceljs.min.js"></script>
+<script src="js/wbs-sync.js"></script>
 <script src="js/ui.js"></script>
 </body>
 </html>

@@ -5,6 +5,10 @@
   "description": "業務と自社作業のタスクを整理し、優先順位・フォロー・AIとの相談をまとめて行うダッシュボード",
   "scripts": {
     "start": "python3 -m http.server 8000",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "template": "node scripts/build-template.js"
+  },
+  "devDependencies": {
+    "exceljs": "^4.4.0"
   }
 }
