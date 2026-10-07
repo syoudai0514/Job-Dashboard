@@ -30,11 +30,14 @@
     { key: 'status', label: '状態', headers: ['状態', 'ステータス'], width: 9 },
     { key: 'deps', label: '先行タスク', headers: ['先行タスク', '先行', '依存', '前提タスク'], width: 14 },
     { key: 'completedOn', label: '完了日', headers: ['完了日', '実績終了日', '完了実績'], width: 12 },
+    { key: 'origin', label: '取込元', headers: ['取込元', '元WBS', '共通WBS'], width: 20 },
     { key: 'notes', label: '備考', headers: ['備考', 'メモ', 'コメント'], width: 30 },
     { key: 'updated', label: '最終更新', headers: ['最終更新', '更新日時', '更新日'], width: 17 },
   ];
   /** 両方で変わったときにダッシュボード側を優先する項目 */
   Core.WBS_EXEC_KEYS = ['status', 'progress', 'completedOn'];
+  /** ダッシュボードが決める項目（Excel で書き換えても元に戻す） */
+  Core.WBS_DASH_KEYS = ['origin'];
   /** 同期対象の項目（ID・最終更新は除く） */
   Core.WBS_SYNC_KEYS = Core.WBS_FIELDS.map((f) => f.key).filter((k) => k !== 'wbsId' && k !== 'updated');
   const DATE_KEYS = ['start', 'due', 'completedOn'];
@@ -159,6 +162,7 @@
       deps: (task.deps || []).map(String).sort().join(','),
       completedOn: done && task.completedAt ? task.completedAt.slice(0, 10) : '',
       notes: task.notes || '',
+      origin: task.src ? (task.src.label || `${task.src.sourceId}:${task.src.id}`) : '',
     };
   };
 
@@ -210,6 +214,7 @@
       if (e === d) { merged[k] = e; continue; }
       if (b !== undefined && d === b) { merged[k] = e; toTask.push(k); continue; }
       if (b !== undefined && e === b) { merged[k] = d; toExcel.push(k); continue; }
+      if (Core.WBS_DASH_KEYS.includes(k)) { merged[k] = d; toExcel.push(k); continue; }
       const dashWins = Core.WBS_EXEC_KEYS.includes(k);
       merged[k] = dashWins ? d : e;
       (dashWins ? toExcel : toTask).push(k);

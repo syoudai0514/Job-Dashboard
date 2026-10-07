@@ -6,12 +6,12 @@
 
 - 画面の言語は日本語。ラベル・メッセージ・コメントも日本語で書く。
 - フレームワークは使わない（素の HTML / CSS / JavaScript）。外部ライブラリを足す場合は理由を説明してから。
-- スクリプトは `<script>` で順に読み込み（core → schedule → wbs-core → store → ai → vendor/exceljs → wbs-sync → ui）、`window.Core` / `Store` / `AI` / `WBS` / `UI` のグローバルで連携する。ES Modules に移行する場合は全ファイルまとめて行う。
+- スクリプトは `<script>` で順に読み込み（core → schedule → wbs-core → sources-core → store → ai → vendor/exceljs → wbs-sync → sources-sync → ui）、`window.Core` / `Store` / `AI` / `WBS` / `Team` / `UI` のグローバルで連携する。ES Modules に移行する場合は全ファイルまとめて行う。
 - データはブラウザの localStorage（キー `job-dashboard:v1`）にのみ保存する。社外への送信を追加しない。AI への送信は、ユーザーが設定画面で明示的に登録した接続先に限る。
 
 ## 責務の分け方
 
-- `js/core.js` / `js/schedule.js` / `js/wbs-core.js`: 画面に依存しない純粋関数だけを置く（DOM・localStorage に触らない）。日付は `YYYY-MM-DD` 文字列で扱う。ここに追加したロジックには必ず `tests/core.test.js` にテストを足す。
+- `js/core.js` / `js/schedule.js` / `js/wbs-core.js` / `js/sources-core.js`: 画面に依存しない純粋関数だけを置く（DOM・localStorage に触らない）。日付は `YYYY-MM-DD` 文字列で扱う。ここに追加したロジックには必ず `tests/core.test.js` にテストを足す。
 - `js/store.js`: 状態の変更は必ず Store のメソッド経由で行い、`save()` で保存と再描画通知をする。保存先を変えるときはこのファイルだけを差し替える。
 - `js/wbs-sync.js`: Excel ファイルの読み書きだけを担当する。同期の判定（どちらの値を採るか）は `Core.mergeRecord` に置き、ここには書かない。Excel への書き込みが成功するまで `wbsBase`（前回同期の値）を確定させないこと（失敗時に変更が巻き戻るのを防ぐため）。
 - `js/ui.js`: 描画は `innerHTML` のテンプレート文字列、操作は `data-action` 属性によるイベント委譲。ユーザー入力を埋め込むときは必ず `h()` でエスケープする。
@@ -28,6 +28,14 @@ README の「データ形式」「優先度スコアのルール」を正とす�
 - Excel から消えた行は自動で削除しない（ユーザーに確認する）。
 - 同期による Store の変更は `meta.source = 'wbs'` を付け、同期のきっかけにしない（無限ループ防止）。
 - 変更したら `tests/wbs.test.js` を更新する。
+
+## チームWBS（取込元）のルール
+
+- チームWBSは計画の正。計画の項目（`Core.SOURCE_PLAN_KEYS`）は、チームWBSで変わったら個人に反映する（両方で変わったらチームWBSが勝つ）。
+- 実行の項目（`Core.SOURCE_EXEC_KEYS`）は個人が正。取込元の `mode` が `'write'` のときだけチームWBSに書き戻す。
+- 新着は自動で取り込まない。本人が選ぶ。チームWBSから消えた・担当が外れたタスクも自動で消さない。
+- 判定は `Core.reconcileSource` に置き、`sources-sync.js` はファイルの読み書きだけを行う。変更は `meta.source = 'team'`、取込元の情報更新は `'team-meta'` で保存する。
+- 変更したら `tests/sources.test.js` と `tests/e2e/team-wbs.e2e.js` を更新する。
 
 ## AI 連携
 

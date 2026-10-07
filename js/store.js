@@ -32,6 +32,7 @@
     start: null, due: null, estimate: null, progress: 0, owner: '', deps: [],
     notes: '', waitingFor: '', subtasks: [], log: [], todayPin: null, todayOrder: null,
     wbsId: null, wbsSkip: false, wbsBase: null, recurringId: null,
+    src: null, // チームWBSから取り込んだとき { sourceId, id, label, base, deps }
     createdAt: null, updatedAt: null, completedAt: null,
   });
 
@@ -75,28 +76,73 @@
       t({ categoryId: 'admin', title: '勤怠の締め確認', estimate: 15, wbsSkip: true, ...done(-5) }),
       t({ categoryId: 'ai', title: 'Copilotハンズオンの議事録共有', estimate: 30, wbsSkip: true, ...done(0) }),
     ];
+    // ---- チームWBS（サンプル）----
+    const R = (o) => ({ wbsId: '', l1: '業務', l2: '', l3: '', title: '', owner: '', priority: '2', difficulty: '2', interrupt: '', start: '', due: '', estimateH: '', progress: '0', status: 'todo', deps: '', completedOn: '', notes: '', origin: '', ...o });
+    const devRows = [
+      R({ wbsId: 'D-101', l2: '開発推進', l3: 'CI導入', title: 'CI導入のパイロット案件を選定', owner: '山田', priority: '1', due: d(3), estimateH: '4', progress: '30', status: 'doing' }),
+      R({ wbsId: 'D-102', l2: '開発推進', l3: 'CI導入', title: 'CIパイプライン構築（パイロット）', owner: '山田', priority: '1', difficulty: '3', due: d(10), estimateH: '16', deps: 'D-101,D-104' }),
+      R({ wbsId: 'D-103', l2: '開発推進', l3: 'CI導入', title: 'パイロット結果の振り返りと展開計画', owner: '山田', due: d(15), estimateH: '3', deps: 'D-102' }),
+      R({ wbsId: 'D-104', l2: '開発推進', l3: 'CI導入', title: '検証用ビルド環境の払い出し', owner: '鈴木', due: d(-2), estimateH: '6', progress: '50', status: 'doing' }),
+      R({ wbsId: 'D-105', l2: '開発推進', l3: 'セキュリティ', title: '脆弱性診断の手配', owner: '山田', priority: '1', due: d(12), estimateH: '3' }),
+      R({ wbsId: 'D-106', l2: '開発推進', l3: 'リリース', title: 'リリース手順書の更新', owner: '山田', due: d(8), estimateH: '4', deps: 'D-107' }),
+      R({ wbsId: 'D-107', l2: '開発推進', l3: 'リリース', title: '本番切替のリハーサル', owner: '高橋', due: d(6), estimateH: '8', difficulty: '3' }),
+      R({ wbsId: 'D-108', l2: '開発推進', l3: 'リリース', title: '移行データの検証', owner: '高橋', due: d(-1), estimateH: '6', progress: '20', status: 'doing' }),
+      R({ wbsId: 'D-201', l2: '標準化', l3: 'コーディング規約', title: '規約v2のレビュー会', owner: '鈴木', due: d(-6), status: 'done', progress: '100', completedOn: d(-6) }),
+      R({ wbsId: 'D-202', l2: '標準化', l3: 'テンプレート', title: 'テスト仕様書テンプレートの改訂', owner: '鈴木', due: d(9), estimateH: '6', progress: '10', status: 'doing' }),
+      R({ wbsId: 'D-203', l2: '標準化', l3: 'テンプレート', title: 'レビュー記録票の様式統一', owner: '', due: d(20), estimateH: '4' }),
+    ];
+    const aiRows = [
+      R({ wbsId: 'G-01', l2: '生成AI導入', l3: 'ガイドライン整備', title: 'Copilot社内利用ガイドライン案を作成', owner: '山田', priority: '1', difficulty: '3', start: d(-3), due: d(2), estimateH: '8', progress: '50', status: 'doing' }),
+      R({ wbsId: 'G-02', l2: '生成AI導入', l3: 'ガイドライン整備', title: '情シス・法務のレビュー', owner: '田中', due: d(6), estimateH: '3', deps: 'G-01' }),
+      R({ wbsId: 'G-03', l2: '生成AI導入', l3: 'ガイドライン整備', title: 'ガイドライン公開・全社周知', owner: '山田', priority: '1', due: d(9), estimateH: '2', deps: 'G-02' }),
+      R({ wbsId: 'G-04', l2: '生成AI導入', l3: '展開・定着', title: '部門別ユースケース集の作成', owner: '山田', priority: '1', difficulty: '2', due: d(18), estimateH: '10' }),
+      R({ wbsId: 'G-05', l2: '生成AI導入', l3: '展開・定着', title: '利用ログの分析レポート', owner: '佐藤', due: d(-3), estimateH: '5', progress: '40', status: 'doing' }),
+      R({ wbsId: 'G-06', l2: '生成AI導入', l3: '展開・定着', title: '各部署の生成AI活用事例をヒアリング', owner: '佐藤', due: d(6), estimateH: '1', status: 'waiting' }),
+    ];
+    const sources = [
+      { id: 'src_dev', name: '開発部 共通WBS', fileName: '開発部_共通WBS.xlsx', mode: 'write', scope: 'mine', includeUnassigned: false, dismissed: [], seen: ['D-105'], rows: devRows, lastRead: at(0) },
+      { id: 'src_ai', name: '生成AI推進WG', fileName: '生成AI推進WG_WBS.xlsx', mode: 'read', scope: 'mine', includeUnassigned: false, dismissed: [], seen: [], rows: aiRows, lastRead: at(0) },
+    ];
+    const link = (wbsId, source, rec) => {
+      const t = tasks.find((x) => x.wbsId === wbsId);
+      t.src = { sourceId: source.id, id: rec.wbsId, label: `${source.name}:${rec.wbsId}`, base: { ...rec }, deps: rec.deps ? rec.deps.split(',') : [] };
+      t.due = rec.due || t.due;
+    };
+    link('W-301', sources[0], devRows[0]);
+    link('W-302', sources[0], devRows[1]);
+    link('W-303', sources[0], devRows[2]);
+    link('W-102', sources[1], aiRows[0]);
+    link('W-104', sources[1], aiRows[2]);
+    const feed = [
+      { id: uid('f'), at: at(0), sourceId: 'src_dev', kind: 'change', taskId: tasks.find((x) => x.wbsId === 'W-302').id, text: '「CIパイプライン構築（パイロット）」期限: ' + Core.formatDate(d(12)) + ' → ' + Core.formatDate(d(10)), read: false },
+      { id: uid('f'), at: at(0), sourceId: 'src_dev', kind: 'new', text: '新しいタスク: D-105 脆弱性診断の手配', read: false },
+      { id: uid('f'), at: at(-1), sourceId: 'src_ai', kind: 'change', taskId: tasks.find((x) => x.wbsId === 'W-104').id, text: '「ガイドライン公開・全社周知」重要度: 中 → 高', read: true },
+    ];
+
     const routines = [
       { id: uid('r'), title: 'メール・チャットの確認と返信', categoryId: 'work-routine', freq: 'weekday', day: 1, priority: 2, estimate: 30, lastGenerated: null },
       { id: uid('r'), title: '週次進捗報告を作成', categoryId: 'work-routine', freq: 'weekly', day: 5, priority: 1, estimate: 45, lastGenerated: null },
       { id: uid('r'), title: '勤怠の締め確認', categoryId: 'admin', freq: 'monthly', day: 31, priority: 2, estimate: 15, lastGenerated: null },
     ];
     return {
-      version: 2, sample: true, tasks, routines,
+      version: 3, sample: true, tasks, routines,
       areas: { work: '業務', own: '自社作業' },
       categories: Core.DEFAULT_CATEGORIES.map((c) => ({ ...c, keywords: [...c.keywords] })),
-      settings: defaultSettings(),
+      settings: { ...defaultSettings(), myName: '山田' },
       journal: { [today]: { plan: '午前中にガイドライン案を仕上げて、午後は規約の反映。', reflection: '' } },
       wbs: { fileName: '', lastSync: null, log: null },
+      sources, feed,
     };
   }
 
   function emptyState() {
     return {
-      version: 2, sample: false, tasks: [], routines: [],
+      version: 3, sample: false, tasks: [], routines: [],
       areas: { work: '業務', own: '自社作業' },
       categories: Core.DEFAULT_CATEGORIES.map((c) => ({ ...c, keywords: [...c.keywords] })),
       settings: defaultSettings(), journal: {},
       wbs: { fileName: '', lastSync: null, log: null },
+      sources: [], feed: [],
     };
   }
 
@@ -111,8 +157,10 @@
     };
     out.areas = { ...base.areas, ...(s.areas || {}) };
     out.wbs = { ...base.wbs, ...(s.wbs || {}) };
+    out.sources = (s.sources || []).map((x) => ({ mode: 'read', scope: 'mine', includeUnassigned: false, dismissed: [], seen: [], rows: [], ...x }));
+    out.feed = s.feed || [];
     out.tasks = (s.tasks || []).map((t) => ({ ...taskDefaults(), ...t }));
-    out.version = 2;
+    out.version = 3;
     return out;
   }
 
@@ -122,7 +170,7 @@
     const raw = localStorage.getItem(KEY);
     const saved = raw ? JSON.parse(raw) : null;
     // 旧バージョンのサンプルのままなら、WBS 項目入りの新しいサンプルに入れ替える
-    state = saved && !(saved.sample && (saved.version || 1) < 2) ? normalize(saved) : sampleState(Core.todayISO());
+    state = saved && !(saved.sample && (saved.version || 1) < 3) ? normalize(saved) : sampleState(Core.todayISO());
   } catch (e) {
     storageOK = false;
     state = sampleState(Core.todayISO());
@@ -256,6 +304,30 @@
       state.settings = { ...state.settings, ...patch };
       save({ source: 'settings' });
     },
+    /* ---- チームWBS（取込元） ---- */
+    source(id) { return state.sources.find((x) => x.id === id) || null; },
+    addSource(src) { state.sources.push(src); save({ source: 'team-meta' }); return src; },
+    updateSource(id, patch, meta) {
+      const src = Store.source(id);
+      if (!src) return null;
+      Object.assign(src, patch);
+      save(meta || { source: 'team-meta' });
+      return src;
+    },
+    removeSource(id) {
+      state.sources = state.sources.filter((x) => x.id !== id);
+      state.tasks.forEach((t) => { if (t.src && t.src.sourceId === id) t.src = null; });
+      save({ source: 'team-meta' });
+    },
+    /** 変更の通知を追加（新しい順に最大200件） */
+    addFeed(items, meta) {
+      if (!items.length) return;
+      const now = nowISO();
+      state.feed = [...items.map((x) => ({ id: uid('f'), at: now, read: false, ...x })), ...state.feed].slice(0, 200);
+      if (meta !== false) save(meta || { source: 'team-meta' });
+    },
+    markFeedRead() { state.feed.forEach((f) => { f.read = true; }); save({ source: 'team-meta' }); },
+
     setWbsMeta(patch) {
       state.wbs = { ...state.wbs, ...patch };
       save({ source: 'wbs-meta' });
@@ -296,7 +368,7 @@
       save();
     },
     clearSample() {
-      state = { ...emptyState(), categories: state.categories, areas: state.areas, settings: { ...state.settings, snoozed: {} }, wbs: state.wbs };
+      state = { ...emptyState(), categories: state.categories, areas: state.areas, settings: { ...state.settings, snoozed: {}, myName: '' }, wbs: state.wbs };
       save();
     },
     loadSample() { state = sampleState(Core.todayISO()); save(); },

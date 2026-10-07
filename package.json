@@ -6,7 +6,8 @@
   "scripts": {
     "start": "python3 -m http.server 8000",
     "test": "node --test tests/*.test.js",
-    "template": "node scripts/build-template.js"
+    "template": "node scripts/build-template.js",
+    "test:e2e": "node tests/e2e/personal-wbs.e2e.js && node tests/e2e/team-wbs.e2e.js"
   },
   "devDependencies": {
     "exceljs": "^4.4.0"

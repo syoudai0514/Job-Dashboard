@@ -139,6 +139,19 @@
     const resolve = (l1, l2) => Store.ensureCategory(l1, l2);
 
     Store.transaction(() => {
+      // 先に、これから行を追加するタスクに ID を振り、チームWBS由来の先行のつながりを ID で付け直す
+      for (const t of st.tasks) {
+        if (t.wbsSkip || t.recurringId || t.wbsId) continue;
+        if (!st.settings.wbs.appendNew && !t.src) continue;
+        t.wbsId = Core.nextWbsId(allIds); allIds.add(t.wbsId);
+      }
+      if (Core.mapSourceDeps) {
+        st.tasks.forEach((t) => {
+          if (!t.src) return;
+          const deps = Core.mapSourceDeps(t, st.tasks);
+          if (deps.join(',') !== (t.deps || []).join(',')) t.deps = deps;
+        });
+      }
       for (const p of parsed) {
         const hadId = !!p.rec.wbsId;
         let id = p.rec.wbsId;
@@ -190,7 +203,7 @@
         if (t.wbsSkip || t.recurringId) continue;
         if (t.wbsId && seen.has(String(t.wbsId))) continue;
         if (t.wbsId && t.wbsBase) { W.missing.push(t.id); log.missing.push(t.title); continue; } // 前回あった → Excel で削除された
-        if (!t.wbsId && !st.settings.wbs.appendNew) continue;
+        if (!t.wbsId && !st.settings.wbs.appendNew && !t.src) continue; // チームWBSから取り込んだタスクは常に載せる
         if (!t.wbsId) { t.wbsId = Core.nextWbsId(allIds); allIds.add(t.wbsId); }
         const rec = Core.recordFromTask(t, Store.state.categories, Store.state.areas);
         cellWrites.push({ append: true, rec, task: t });
@@ -306,7 +319,7 @@
 
   let debounce = null;
   Store.onChange((st, meta) => {
-    if (['wbs', 'wbs-meta', 'journal', 'settings', 'routine'].includes(meta.source)) return;
+    if (['wbs', 'wbs-meta', 'team-meta', 'journal', 'settings', 'routine'].includes(meta.source)) return;
     W.dirty = true;
     if (W.handle && W.status === 'connected') {
       clearTimeout(debounce);
@@ -328,7 +341,7 @@
     return true;
   }
 
-  const XLSX_TYPES = [{ description: 'Excel ブック', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }];
+  const XLSX_TYPES = W.XLSX_TYPES = [{ description: 'Excel ブック', accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }];
 
   W.connect = async () => {
     if (!canAutoSync) return;
@@ -412,6 +425,8 @@
   };
 
   W.onChange = (fn) => listeners.push(fn);
+  /** チームWBSの同期（sources-sync.js）と共用する部品 */
+  W.lib = { cellRaw, isFormula, isMergedSlave, locate, readRows, stamp, idbGet, idbSet, idbDel, canAutoSync, XLSX_TYPES };
 
   /** 起動時: 前回のファイルに自動で再接続（許可が切れていればボタン表示） */
   W.boot = async () => {

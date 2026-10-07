@@ -329,7 +329,7 @@
   Core.DEADLINE_LABELS = { overdue: '期限超過', today: '今日', tomorrow: '明日', week: '今週', nextWeek: '来週' };
 
   /* ---------- フォロー（声かけ）判定 ---------- */
-  Core.followUps = (tasks, today, settings, categories) => {
+  Core.followUps = (tasks, today, settings, categories, team) => {
     const s = settings || {};
     const snoozed = s.snoozed || {};
     const items = [];
@@ -447,6 +447,37 @@
       });
     }
 
+    // チームWBS: 新着・上流の遅延・反映した変更
+    if (team && Core.sourceInbox) {
+      for (const src of team.sources || []) {
+        const inbox = Core.sourceInbox(src.rows || [], tasks, src, s.myName);
+        if (inbox.length) {
+          push({
+            id: `inbox:${src.id}:${inbox.map((r) => r.wbsId).join(',')}`, level: 'warn',
+            title: `「${src.name}」にあなたの新しいタスクが${inbox.length}件あります`,
+            detail: inbox.slice(0, 4).map((r) => `・${r.wbsId} ${r.title}${r.due ? `（${Core.formatDate(r.due)}）` : ''}`).join('\n'),
+            actions: ['show-team'],
+          });
+        }
+      }
+      const schedT = Core.schedule(tasks, today, s);
+      Core.upstreamIssues(tasks, team.sources || [], today, schedT).forEach((u) => push({
+        id: `up:${u.task.id}:${u.rec.wbsId}:${u.text.length}`, level: u.level, taskId: u.task.id,
+        title: `「${u.task.title}」: ${u.text}`,
+        detail: 'チームWBSの状況です。担当者に状況を確認するか、計画の引き直しを相談しましょう。',
+        actions: ['open', 'ai-impact'],
+      }));
+      const unread = (team.feed || []).filter((f) => !f.read && f.kind === 'change');
+      if (unread.length) {
+        push({
+          id: `feed:${unread[0].id}`, level: 'info',
+          title: `チームWBSの変更を${unread.length}件反映しました`,
+          detail: unread.slice(0, 4).map((f) => `・${f.text}`).join('\n'),
+          actions: ['show-team'],
+        });
+      }
+    }
+
     const plan = Core.planToday(tasks, today, s);
     if (plan.minutes > plan.capacity) {
       push({
@@ -511,6 +542,7 @@
     breakdown: { label: 'タスク分解', desc: '大きい・止まっているタスクを30〜90分単位の手順に分ける' },
     extract: { label: 'メモからタスク化', desc: '議事録・チャット・メモを貼り付けてタスクを抜き出す' },
     consult: { label: '壁打ち', desc: '進め方や判断に迷っていることを一緒に考える' },
+    impact: { label: 'チームWBSとの整合', desc: 'チームWBSの変更・新着・上流の遅延が自分の計画に与える影響を確認し、打ち手と上長への報告文を作る' },
     risk: { label: 'ボトルネック・リスク', desc: '遅れそうなタスクと後続を止めているタスクを渡して、打ち手と計画の引き直しを相談する' },
     review: { label: '週次振り返り', desc: '今週の実績から、良かった点・課題・来週の重点を整理する' },
   };
@@ -553,6 +585,25 @@
         + `${ctx.task ? `\n関連タスク:\n${JSON.stringify(Core.taskForPrompt(ctx.task, categories), null, 1)}\n` : ''}`
         + `\n参考: 現在の未完了タスク（${open.length}件）\n${JSON.stringify(open.slice(0, 30).map((t) => ({ title: t.title, 区分: catLabelOf(t, categories), 期限: t.due })), null, 0)}\n\n`
         + `新しくやるべきことが出てきた場合のみ、${JSON_RULE}\n{"tasks":[{"title":"","category":"区分","priority":2,"due":null,"estimate":30,"note":""}]}`;
+    } else if (mode === 'impact') {
+      const sched = Core.schedule(tasks, today, settings);
+      const srcs = ctx.sources || [];
+      const ups = Core.upstreamIssues(tasks, srcs, today, sched).map((u) => ({ タスク: u.task.title, id: u.task.id, 指摘: u.text }));
+      const changes = (ctx.feed || []).filter((f) => Core.diffDays(today, f.at.slice(0, 10)) <= 7).map((f) => f.text);
+      const inbox = srcs.flatMap((src) => Core.sourceInbox(src.rows || [], tasks, src, settings && settings.myName)
+        .map((r) => ({ 取込元: src.name, ID: r.wbsId, title: r.title, 期限: r.due || null, 見積h: r.estimateH || null, 先行: r.deps || null })));
+      const linked = open.filter((t) => t.src).map((t) => {
+        const sc = sched.get(t.id);
+        return { ...Core.taskForPrompt(t, categories), 取込元: t.src.label, 余裕日数: sc && Number.isFinite(sc.float) ? sc.float : null };
+      });
+      user = `${head}チームWBS（上位者が管理する共通の計画）と、私の個人計画の整合を確認してください。\n`
+        + 'チームWBSの期限は原則動かせません。私の側で前倒し・分割・優先順位の入れ替えで吸収できるものと、上長に相談すべきもの（期限調整・人の追加・先行タスクの督促）を分けてください。\n'
+        + `${ctx.text ? `補足: ${ctx.text}\n` : ''}`
+        + `\n直近7日にチームWBSで変わったこと:\n${JSON.stringify(changes, null, 0)}\n`
+        + `\n上流の遅延・注意:\n${JSON.stringify(ups, null, 1)}\n`
+        + `\nまだ取り込んでいない新着タスク:\n${JSON.stringify(inbox, null, 1)}\n`
+        + `\nチームWBSから取り込んだ私のタスク:\n${JSON.stringify(linked, null, 1)}\n\n`
+        + `${JSON_RULE}\n{"order":[{"id":"今日着手すべきタスクID","reason":"理由"}],"defer":[{"id":"個人の期限を動かすタスクID","newDue":"YYYY-MM-DD","reason":"理由"}],"tasks":[{"title":"新たに必要な個人タスク（督促・確認など）","category":"区分","priority":1,"due":"YYYY-MM-DD","estimate":15,"note":""}],"report":"上長・チームへの報告／相談文（そのまま送れる文面）","advice":"全体への助言"}`;
     } else if (mode === 'risk') {
       const sched = Core.schedule(tasks, today, settings);
       const bn = Core.bottlenecks(tasks, today, settings, sched);
@@ -624,7 +675,7 @@
         },
       };
     };
-    if (mode === 'plan' || mode === 'risk') {
+    if (mode === 'plan' || mode === 'risk' || mode === 'impact') {
       (data.order || []).forEach((o, i) => {
         const t = byId(o.id);
         if (t) out.push({ kind: 'pin', taskId: t.id, label: `${i + 1}. 今日やる: ${t.title}`, note: o.reason, payload: { order: i } });
@@ -635,7 +686,8 @@
           out.push({ kind: 'due', taskId: t.id, label: `期限変更: ${t.title} → ${Core.formatDate(o.newDue)}`, note: o.reason, payload: { due: o.newDue } });
         }
       });
-      if (mode === 'risk') (data.tasks || []).filter((x) => x && x.title).forEach((x) => out.push(newTask(x)));
+      if (mode === 'risk' || mode === 'impact') (data.tasks || []).filter((x) => x && x.title).forEach((x) => out.push(newTask(x)));
+      if (data.report) out.push({ kind: 'report', label: '報告・相談文を表示する（コピーして送信）', payload: { text: String(data.report) } });
     } else if (mode === 'breakdown') {
       const t = ctx.task && byId(ctx.task.id);
       if (t) {

@@ -3,6 +3,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 require('../js/core.js');
 require('../js/schedule.js');
+require('../js/wbs-core.js');
+require('../js/sources-core.js');
 const { Core } = globalThis;
 
 const cats = Core.DEFAULT_CATEGORIES;

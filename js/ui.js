@@ -5,7 +5,7 @@
  */
 (function (root) {
   'use strict';
-  const { Core, Store, AI, WBS } = root;
+  const { Core, Store, AI, WBS, Team } = root;
   const $ = (sel, el) => (el || document).querySelector(sel);
 
   const ui = {
@@ -17,6 +17,8 @@
     wbsCollapsed: new Set(),
     wbsHideDone: false,
     ctx: null, // 描画ごとに計算する { sched, bn, follows }
+    inboxSel: {}, // チームWBSの新着で選んだもの { 'sourceId|id': true }
+    teamOpen: {}, // チーム全体の状況で開いている取込元
     confirmDelete: false,
     textPanel: null, // { title, text } ドロワーに文章を表示するとき
     ai: { mode: 'plan', taskId: '', text: '', prompt: null, response: '', proposals: null, prose: '', selected: {}, busy: false, error: '' },
@@ -93,6 +95,7 @@
       breakdown: 'AIと分解する', open: '詳細を開く', 'ai-plan': 'AIと優先順位を相談',
       'add-in-category': 'タスクを追加', 'ai-consult': 'AIと考える',
       'show-today': '今日期限を見る', 'show-week': '今週期限を見る', 'ai-risk': 'AIと打ち手を考える',
+      'show-team': 'チームWBSを見る', 'ai-impact': 'AIと影響を確認',
     };
     const actions = (compact ? f.actions.slice(0, 2) : f.actions)
       .map((a, i) => `<button class="btn btn-sm ${i === 0 ? 'btn-primary' : ''}" type="button" data-action="follow" data-follow="${h(f.id)}" data-kind="${a}" data-id="${t ? t.id : ''}" data-cat="${h(f.categoryId || '')}">${ACTION[a]}</button>`)
@@ -108,7 +111,7 @@
 
   /* ---------- ナビ ---------- */
   const VIEWS = [
-    ['today', '今日'], ['wbs', 'WBS'], ['matrix', 'マトリクス'], ['tasks', 'タスク'], ['follow', 'フォロー'],
+    ['today', '今日'], ['team', 'チームWBS'], ['wbs', '個人WBS'], ['matrix', 'マトリクス'], ['tasks', 'タスク'], ['follow', 'フォロー'],
     ['ai', 'AIと考える'], ['review', '振り返り'], ['settings', '設定'],
   ];
   function renderNav(follows) {
@@ -118,6 +121,10 @@
       let badge = '';
       if (id === 'follow' && follows.length) badge = `<span class="badge${urgent ? '' : ' soft'}">${urgent || follows.length}</span>`;
       if (id === 'tasks') badge = `<span class="badge soft">${open}</span>`;
+      if (id === 'team') {
+        const n = S().sources.reduce((a, src) => a + Core.sourceInbox(src.rows || [], S().tasks, src, S().settings.myName).length, 0);
+        if (n) badge = `<span class="badge" title="新着タスク">${n}</span>`;
+      }
       if (id === 'wbs' && WBS) {
         const dot = { connected: 'ok', syncing: 'ok', locked: 'warn', 'needs-permission': 'warn', error: 'crit' }[WBS.status];
         if (dot) badge = `<span class="sync-dot ${dot}" title="Excel 同期: ${h(WBS_LABEL[WBS.status] || '')}"></span>`;
@@ -267,6 +274,12 @@
     if (a.mode === 'breakdown') inputs = taskSelect('分解するタスク', true) + textArea('補足（任意）', '例: 情シスのレビューが必要。来週の部会で説明したい');
     if (a.mode === 'extract') inputs = textArea('議事録・チャット・メモを貼り付け', '例: 定例の議事録、上司からのチャット、手書きメモの書き起こし', 8);
     if (a.mode === 'consult') inputs = textArea('相談したいこと', '例: Copilotの全社展開、まずどの部署から始めるのがいいか迷っている', 5) + taskSelect('関連するタスク（任意）', false);
+    if (a.mode === 'impact') {
+      const nIn = S().sources.reduce((x, src) => x + Core.sourceInbox(src.rows || [], S().tasks, src, S().settings.myName).length, 0);
+      const nUp = Core.upstreamIssues(S().tasks, S().sources, ui.today, ui.ctx.sched).length;
+      inputs = `<p class="note">チームWBS ${S().sources.length}件の、直近7日の変更・新着 <b class="num">${nIn}</b>件・上流の遅延 <b class="num">${nUp}</b>件・取り込み済みタスクを渡します。</p>`
+        + textArea('補足（任意）', '例: 来週は研修で2日不在。D-104 の鈴木さんには昨日催促済み');
+    }
     if (a.mode === 'risk') inputs = `<p class="note">ボトルネック候補 <b class="num">${ui.ctx.bn.items.length}</b>件と担当別の負荷を渡します。</p>` + textArea('補足（任意）', '例: W-302 は外部ベンダー待ちの可能性あり。来週は研修で2日不在');
     if (a.mode === 'review') {
       const s = Core.completionStats(st.tasks, ui.today, st.categories, 7);
@@ -536,6 +549,130 @@
       </div>`;
   }
 
+  /* ---------- チームWBS ---------- */
+  const SRC_LABEL = { connected: '自動で読み取り中', syncing: '読み取り中', locked: '書き戻し待ち', 'needs-permission': '再接続が必要', error: 'エラー', offline: '未接続' };
+  function viewTeam() {
+    const st = S();
+    const me = st.settings.myName;
+    const fmt = (iso) => { if (!iso) return '—'; const d = new Date(iso); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
+    const issues = Core.upstreamIssues(st.tasks, st.sources, ui.today, ui.ctx.sched);
+    const cards = st.sources.map((src) => {
+      const s0 = Team ? Team.status(src.id) : { status: 'offline', message: '' };
+      const pill = { connected: 'ok', syncing: 'ok', locked: 'warn', 'needs-permission': 'warn', error: 'crit' }[s0.status] || 'idle';
+      const rows = src.rows || [];
+      const mine = rows.filter((r) => Core.isMine(r, src, me));
+      const linked = st.tasks.filter((t) => t.src && t.src.sourceId === src.id).length;
+      const late = Core.teamOverview(rows, ui.today, st.settings).late.length;
+      const pr = Team ? Team.problems(src.id) : { removed: [], reassigned: [] };
+      const nProb = pr.removed.length + pr.reassigned.length;
+      const connected = Team && Team.isConnected(src.id);
+      return `<section class="panel src-card">
+        <div class="row between"><h3>${h(src.name)}</h3><span class="sync-pill ${pill}">${SRC_LABEL[s0.status] || '未接続'}</span></div>
+        <div class="src-meta"><span>${h(src.fileName || '')}</span><span>最終読み取り ${fmt(src.lastRead)}</span></div>
+        <div class="src-stats">
+          <div><span class="label">全体</span><b class="num">${rows.length}</b></div>
+          <div><span class="label">自分の担当</span><b class="num">${mine.length}</b></div>
+          <div><span class="label">取り込み済み</span><b class="num">${linked}</b></div>
+          <div class="${late ? 'alert' : ''}"><span class="label">遅延</span><b class="num">${late}</b></div>
+        </div>
+        <div class="src-settings">
+          <label class="field"><span>表示名</span><input class="input" id="src-name-${src.id}" data-src="${src.id}" data-src-field="name" value="${h(src.name)}"></label>
+          <label class="field"><span>あなたの権限</span><select class="select" id="src-mode-${src.id}" data-src="${src.id}" data-src-field="mode">
+            <option value="read" ${src.mode !== 'write' ? 'selected' : ''}>読み取りのみ（個人WBSだけ更新）</option>
+            <option value="write" ${src.mode === 'write' ? 'selected' : ''}>書き戻しあり（進捗・追加を共通WBSへ）</option></select></label>
+          <label class="field"><span>取り込む範囲</span><select class="select" id="src-scope-${src.id}" data-src="${src.id}" data-src-field="scope">
+            <option value="mine" ${src.scope !== 'all' ? 'selected' : ''}>自分が担当のタスク</option>
+            <option value="all" ${src.scope === 'all' ? 'selected' : ''}>すべてのタスク</option></select></label>
+          <label class="quick-pin"><input type="checkbox" id="src-unassigned-${src.id}" data-src="${src.id}" data-src-field="includeUnassigned" ${src.includeUnassigned ? 'checked' : ''}> 担当が空欄のタスクも候補にする</label>
+        </div>
+        ${s0.message ? `<p class="note ${['error', 'locked', 'needs-permission'].includes(s0.status) ? 'warn' : ''}">${h(s0.message)}</p>` : ''}
+        ${nProb ? `<div class="note warn"><div>チームWBSから消えた・担当が外れたタスクが ${nProb} 件あります。</div><div class="row" style="margin-top:6px">
+          <button class="btn btn-sm" type="button" data-action="team-problems" data-src="${src.id}" data-value="unlink">個人タスクとして残す</button>
+          <button class="btn btn-sm btn-danger" type="button" data-action="team-problems" data-src="${src.id}" data-value="delete">ダッシュボードから削除</button></div></div>` : ''}
+        <div class="row">
+          ${connected ? `<button class="btn btn-sm" type="button" data-action="team-sync" data-src="${src.id}">今すぐ読む</button>`
+            : Team && Team.canAutoSync ? `<button class="btn btn-sm btn-primary" type="button" data-action="team-reconnect" data-src="${src.id}">ファイルに接続</button>`
+              : `<label class="btn btn-sm btn-primary" for="team-file-${src.id}">ファイルを読み込む</label><input type="file" id="team-file-${src.id}" data-team-file="${src.id}" accept=".xlsx" hidden>`}
+          <button class="btn btn-sm btn-ghost btn-danger" type="button" data-action="team-remove" data-src="${src.id}">登録を解除</button>
+        </div>
+      </section>`;
+    }).join('');
+
+    const inboxBlocks = st.sources.map((src) => {
+      const inbox = Core.sourceInbox(src.rows || [], st.tasks, src, me);
+      if (!inbox.length) return '';
+      return `<div class="inbox-src"><h3>${h(src.name)} <span class="num muted">${inbox.length}</span></h3>
+        <ul class="inbox">${inbox.map((r) => {
+          const key = `${src.id}|${r.wbsId}`;
+          return `<li><label><input type="checkbox" data-action="inbox-sel" data-key="${h(key)}" ${ui.inboxSel[key] !== false ? 'checked' : ''}>
+            <span class="inbox-body"><span class="mcard-title">${r.wbsId.startsWith('#') ? '' : `<span class="wbs-id">${h(r.wbsId)}</span>`}${h(r.title)}</span>
+            <span class="task-meta"><span class="chip">${h([r.l1, r.l2, r.l3].filter(Boolean).join(' / '))}</span>
+              ${r.due ? `<span class="chip due-${Core.dueInfo(r.due, ui.today).state}">${h(Core.formatDate(r.due))}</span>` : ''}
+              ${r.owner ? `<span class="chip">${h(r.owner)}</span>` : '<span class="chip area-none">担当未定</span>'}
+              ${r.priority === '1' ? '<span class="chip prio-1">重要</span>' : ''}
+              ${r.estimateH ? `<span class="est">${h(r.estimateH)}h</span>` : ''}${r.deps ? `<span class="est">先行 ${h(r.deps)}</span>` : ''}</span></span></label></li>`;
+        }).join('')}</ul>
+        <div class="row"><button class="btn btn-primary btn-sm" type="button" data-action="inbox-take" data-src="${src.id}">選んだタスクを取り込む</button>
+          <button class="btn btn-sm btn-ghost" type="button" data-action="inbox-dismiss" data-src="${src.id}">選んだタスクを無視</button></div></div>`;
+    }).join('');
+
+    const feed = st.feed.slice(0, 25);
+    const unread = st.feed.filter((f) => !f.read).length;
+    const srcName = (id) => (Store.source(id) || {}).name || '';
+    const overview = st.sources.map((src) => {
+      const o = Core.teamOverview(src.rows || [], ui.today, st.settings);
+      if (!o.total) return '';
+      const open = ui.teamOpen[src.id];
+      return `<section class="panel">
+        <div class="section-head"><h2>${h(src.name)}</h2><span class="muted">完了 ${o.done}/${o.total}</span></div>
+        <div class="team-tree">${o.tree.map((g) => `<div class="tt-row lv1"><span>${trendBadge(g.rollup.trend)}</span><span class="tt-name">${h(g.name)}</span><span class="tt-prog">${progressBar(g.rollup.actual, g.rollup.expected)}</span><span class="tt-late">${g.rollup.overdue ? `<span class="chip due-overdue">超過 ${g.rollup.overdue}</span>` : ''}</span></div>
+          ${g.children.map((c) => `<div class="tt-row lv2"><span>${trendBadge(c.rollup.trend)}</span><span class="tt-name">${h(c.name)}</span><span class="tt-prog">${progressBar(c.rollup.actual, c.rollup.expected)}</span><span class="tt-late">${c.rollup.overdue ? `<span class="chip due-overdue">超過 ${c.rollup.overdue}</span>` : ''}</span></div>`).join('')}`).join('')}</div>
+        ${o.late.length ? `<h3 style="margin-top:14px">遅れているタスク <span class="num muted">${o.late.length}</span></h3>
+          <div class="table-wrap"><table class="table late-table"><thead><tr><th>ID</th><th>タスク</th><th>担当</th><th>期限</th><th>状況</th></tr></thead><tbody>
+          ${o.late.slice(0, open ? 50 : 6).map((l) => `<tr><td class="wbs-id">${h(l.task.wbsId)}</td><td>${h(l.task.title)}</td><td>${h(l.task.owner || '未定')}</td>
+            <td>${l.task.due ? h(Core.formatDate(l.task.due)) : '—'}</td><td>${l.overdue ? `<span class="chip due-overdue">${Core.diffDays(ui.today, l.task.due)}日超過</span>` : `<span class="chip due-soon">${-l.float}日遅れ見込み</span>`} <span class="est">${l.task.progress}%</span></td></tr>`).join('')}
+          </tbody></table></div>${o.late.length > 6 ? `<button class="btn btn-sm btn-ghost" type="button" data-action="team-open" data-src="${src.id}">${open ? '閉じる' : `すべて表示（${o.late.length}）`}</button>` : ''}` : '<p class="empty">遅れているタスクはありません。</p>'}
+        <h3 style="margin-top:14px">担当別</h3>
+        <div class="owner-grid">${o.owners.map((w) => `<div class="owner ${w.late ? 'has-late' : ''}"><b>${h(w.owner)}</b><span class="num">未完了 ${w.open}</span>${w.late ? `<span class="num late">遅延 ${w.late}</span>` : ''}</div>`).join('')}</div>
+      </section>`;
+    }).join('');
+
+    return `
+      <div class="view-head"><div><h1>チームWBS</h1><p>上位者が管理する共通WBSを常に読み取り、自分のタスクを個人WBSに取り込みます。期限などの変更は自動で反映し、遅延と新着をお知らせします。</p></div>
+        <button class="btn" type="button" data-action="goto-ai" data-mode="impact">AIと影響を確認</button></div>
+      ${!me ? `<div class="note warn" style="margin-bottom:16px">「自分の担当」を判定するために、設定の「自分の名前（担当欄）」にチームWBSの担当欄と同じ名前を入れてください。</div>` : ''}
+      <div class="src-grid">${cards}
+        <section class="panel src-add">
+          <h3>チームWBSを追加</h3>
+          <p class="muted">チームやプロジェクトの共通WBS（Excel）を登録します。複数登録できます。登録しても共通WBSは変更しません（書き戻しありにした場合を除く）。</p>
+          ${Team && Team.canAutoSync ? '<button class="btn btn-primary" type="button" data-action="team-add">ファイルを選んで追加</button>'
+            : '<label class="btn btn-primary" for="team-file-new">ファイルを読み込んで追加</label><input type="file" id="team-file-new" data-team-file="" accept=".xlsx" hidden><p class="muted" style="font-size:.8rem">このブラウザでは自動で読み直せません（Edge / Chrome なら自動）。</p>'}
+        </section>
+      </div>
+
+      <div class="grid-2" style="margin-top:20px">
+        <div class="stack">
+          <section class="panel">
+            <div class="section-head"><h2>新着タスク</h2><span class="muted">取り込むと個人WBSにも追加されます</span></div>
+            ${inboxBlocks || '<p class="empty">新しく割り当てられたタスクはありません。</p>'}
+          </section>
+          ${overview}
+        </div>
+        <div class="stack">
+          <section class="panel">
+            <div class="section-head"><h2>上流の遅延・注意 <span class="num muted">${issues.length}</span></h2></div>
+            ${issues.length ? `<ul class="bn-mini">${issues.map((u) => `<li><button type="button" data-action="open" data-id="${u.task.id}"><span class="bn-title">${h(u.task.title)}</span><span class="bn-why ${u.level === 'critical' ? 'crit' : ''}">${h(u.text)}</span></button></li>`).join('')}</ul>`
+              : '<p class="empty">取り込んだタスクの先行に遅れはありません。</p>'}
+          </section>
+          <section class="panel">
+            <div class="section-head"><h2>変更の通知 ${unread ? `<span class="badge-inline">${unread}</span>` : ''}</h2>${unread ? '<button class="btn btn-sm btn-ghost" type="button" data-action="feed-read">すべて既読</button>' : ''}</div>
+            ${feed.length ? `<ul class="feed">${feed.map((f) => `<li class="${f.read ? '' : 'unread'} fk-${f.kind}"><time>${h(fmt(f.at))}</time><span><span class="feed-src">${h(srcName(f.sourceId))}</span>${f.taskId && Store.task(f.taskId) ? `<button class="link" type="button" data-action="open" data-id="${f.taskId}">${h(f.text)}</button>` : h(f.text)}</span></li>`).join('')}</ul>`
+              : '<p class="empty">まだ通知はありません。</p>'}
+          </section>
+        </div>
+      </div>`;
+  }
+
   /* ---------- 優先度マトリクス ---------- */
   function matrixCard(item) {
     const t = item.task;
@@ -708,6 +845,30 @@
   }
 
   /* ---------- ドロワー（タスク詳細） ---------- */
+  function teamInfo(t) {
+    const st = S();
+    if (t.recurringId) return '';
+    if (t.src) {
+      const src = Store.source(t.src.sourceId);
+      const rec = src && (src.rows || []).find((r) => String(r.wbsId) === String(t.src.id));
+      const diffDue = rec && rec.due && t.due && rec.due !== t.due;
+      return `<div class="team-box"><div><b>取込元</b> ${h(src ? src.name : '（削除された取込元）')} <span class="wbs-id">${h(t.src.id)}</span>
+          <span class="chip ${src && src.mode === 'write' ? 'st-doing' : ''}">${src && src.mode === 'write' ? '書き戻しあり' : '読み取りのみ'}</span></div>
+        ${rec ? `<div class="muted">チームWBS: 担当 ${h(rec.owner || '未定')}・期限 ${rec.due ? h(Core.formatDate(rec.due)) : '未定'}・${h(Core.STATUS[rec.status] || '')} ${h(rec.progress || 0)}%</div>` : ''}
+        ${diffDue ? `<div class="${t.due > rec.due ? 'neg' : ''}">個人の期限 ${h(Core.formatDate(t.due))}（チームWBSは ${h(Core.formatDate(rec.due))}）</div>` : ''}
+        <div class="muted">期限・タスク名などはチームWBSで変わると自動で更新されます。${src && src.mode === 'write' ? '状態・進捗・完了日はチームWBSにも書き戻します。' : '状態・進捗は個人WBSだけに記録されます。'}</div>
+        <div class="row"><button class="btn btn-sm btn-ghost" type="button" data-action="team-unlink" data-id="${t.id}">紐づけを外す</button></div></div>`;
+    }
+    if (!st.sources.length) return '';
+    const writable = st.sources.filter((x) => x.mode === 'write' && Team && Team.isConnected(x.id));
+    const opts = st.sources.map((x) => `<option value="${x.id}">${h(x.name)}${x.mode === 'write' ? '' : '（読み取りのみ）'}</option>`).join('');
+    return `<div class="team-box"><div><b>共通WBSに載せる</b> <span class="muted">このタスクは個人だけのタスクです。</span></div>
+      <div class="row"><label class="visually-hidden" for="d-src">取込元</label><select class="select" id="d-src" style="width:auto">${opts}</select>
+        ${writable.length ? `<button class="btn btn-sm" type="button" data-action="team-promote" data-id="${t.id}">共通WBSに追加</button>` : ''}
+        <button class="btn btn-sm btn-ghost" type="button" data-action="team-request" data-id="${t.id}">追加依頼文を作る</button></div>
+      <div class="muted">書き戻し権限がある取込元には直接追加できます。権限がない場合は依頼文をリーダーに送ってください。</div></div>`;
+  }
+
   function scheduleInfo(t) {
     if (t.status === 'done') return '';
     const sc = Core.schedule(S().tasks, ui.today, S().settings).get(t.id);
@@ -770,6 +931,7 @@
         </div>
       </div>
       ${scheduleInfo(t)}
+      ${teamInfo(t)}
       <div class="field"><span>手順・サブタスク</span>
         <ul class="sub-list">${(t.subtasks || []).map((s) => `<li class="${s.done ? 'done' : ''}"><input type="checkbox" data-action="sub-toggle" data-sub="${s.id}" ${s.done ? 'checked' : ''} aria-label="完了"><span>${h(s.title)}</span><button class="x" type="button" data-action="sub-del" data-sub="${s.id}" aria-label="削除">×</button></li>`).join('')}</ul>
         <form class="row" data-form="sub-add"><input class="input" id="d-sub" placeholder="手順を追加して Enter" style="flex:1"><button class="btn btn-sm" type="submit">追加</button></form>
@@ -830,7 +992,7 @@
   /* ---------- 描画 ---------- */
   function render() {
     const st = S();
-    const follows = Core.followUps(st.tasks, ui.today, st.settings, st.categories);
+    const follows = Core.followUps(st.tasks, ui.today, st.settings, st.categories, { sources: st.sources, feed: st.feed });
     const sched = Core.schedule(st.tasks, ui.today, st.settings);
     ui.ctx = { follows, sched, bn: Core.bottlenecks(st.tasks, ui.today, st.settings, sched) };
     renderNav(follows);
@@ -839,7 +1001,7 @@
     const scroll = window.scrollY;
     const html = {
       today: () => viewToday(follows), tasks: viewTasks, follow: () => viewFollow(follows),
-      ai: viewAI, review: viewReview, settings: viewSettings, wbs: viewWBS, matrix: viewMatrix,
+      ai: viewAI, review: viewReview, settings: viewSettings, wbs: viewWBS, matrix: viewMatrix, team: viewTeam,
     }[ui.view] || (() => viewToday(follows));
     view.innerHTML = html();
     window.scrollTo(0, scroll);
@@ -864,7 +1026,7 @@
 
   function aiContext() {
     const st = S();
-    return { today: ui.today, tasks: st.tasks, categories: st.categories, settings: st.settings, journal: st.journal, text: ui.ai.text, task: ui.ai.taskId ? Store.task(ui.ai.taskId) : null };
+    return { today: ui.today, tasks: st.tasks, categories: st.categories, settings: st.settings, journal: st.journal, sources: st.sources, feed: st.feed, text: ui.ai.text, task: ui.ai.taskId ? Store.task(ui.ai.taskId) : null };
   }
 
   function gotoAI(mode, taskId, text) {
@@ -923,6 +1085,7 @@
       if (p.kind === 'estimate') Store.updateTask(p.taskId, { estimate: p.payload.estimate });
       if (p.kind === 'log') Store.updateTask(p.taskId, {}, p.payload.text);
       if (p.kind === 'add') Store.addTask(p.payload, 'AIの提案から追加');
+      if (p.kind === 'report') ui.pendingReport = p.payload.text;
       if (p.kind === 'journal') {
         const cur = (S().journal[p.payload.date] || {}).reflection || '';
         Store.setJournal(p.payload.date, 'reflection', cur ? `${cur}\n\n${p.payload.text}` : p.payload.text);
@@ -931,6 +1094,7 @@
     toast(`${n}件の変更を反映しました`);
     ui.ai.proposals = null; ui.ai.prompt = null; ui.ai.response = ''; ui.ai.prose = '';
     if (a.mode === 'plan') setView('today'); else render();
+    if (ui.pendingReport) { showText('報告・相談文', ui.pendingReport); ui.pendingReport = null; }
   }
 
   function handleFollow(kind, id, followId, catId) {
@@ -949,6 +1113,8 @@
     if (kind === 'open' && t) openDrawer(id);
     if (kind === 'ai-plan') gotoAI('plan');
     if (kind === 'ai-risk') gotoAI('risk');
+    if (kind === 'ai-impact') gotoAI('impact');
+    if (kind === 'show-team') setView('team');
     if (kind === 'show-today' || kind === 'show-week') { ui.deadline = kind === 'show-today' ? 'today' : 'week'; setView('today'); }
     if (kind === 'add-in-category') prefillQuick(catId);
     if (kind === 'ai-consult') {
@@ -1018,6 +1184,38 @@
       case 'deadline': ui.deadline = ui.deadline === btn.dataset.bucket ? null : btn.dataset.bucket; render(); break;
       case 'matrix-axis': Store.updateSettings({ matrixAxis: btn.dataset.value }); break;
       case 'wbs-connect': WBS.connect(); break;
+      case 'team-add': Team.add(); break;
+      case 'team-sync': Team.syncNow(btn.dataset.src); break;
+      case 'team-reconnect': Team.reconnect(btn.dataset.src); break;
+      case 'team-remove': {
+        if (btn.dataset.confirm !== '1') { btn.dataset.confirm = '1'; btn.textContent = 'もう一度押すと解除'; break; }
+        Team.remove(btn.dataset.src); toast('登録を解除しました（取り込んだタスクは個人タスクとして残ります）');
+        break;
+      }
+      case 'team-problems': Team.resolveProblems(btn.dataset.src, btn.dataset.value); break;
+      case 'team-open': ui.teamOpen[btn.dataset.src] = !ui.teamOpen[btn.dataset.src]; render(); break;
+      case 'inbox-sel': ui.inboxSel[btn.dataset.key] = btn.checked; break;
+      case 'inbox-take': case 'inbox-dismiss': {
+        const src = Store.source(btn.dataset.src);
+        const ids = Core.sourceInbox(src.rows || [], S().tasks, src, S().settings.myName).map((r) => r.wbsId).filter((x) => ui.inboxSel[`${src.id}|${x}`] !== false);
+        if (!ids.length) { toast('タスクを選んでください'); break; }
+        if (action === 'inbox-take') { const n = Team.takeIn(src.id, ids); toast(`${n}件を取り込みました。個人WBSにも追加されます`); }
+        else { Team.dismiss(src.id, ids); toast(`${ids.length}件を無視しました`); }
+        break;
+      }
+      case 'feed-read': Store.markFeedRead(); break;
+      case 'team-unlink': Team.unlink(btn.dataset.id); renderDrawer(); break;
+      case 'team-promote': {
+        const srcId = $('#d-src').value;
+        Team.promote(btn.dataset.id, srcId).then((id) => { if (id) { toast(`共通WBSに ${id} として追加しました`); renderDrawer(); } else toast('追加できませんでした。チームWBS画面の状態を確認してください'); });
+        break;
+      }
+      case 'team-request': {
+        const t = Store.task(btn.dataset.id);
+        const src = Store.source($('#d-src').value);
+        showText('共通WBSへの追加依頼', Core.addRequestText(t, src, cats(), Core.AREAS, S().settings.myName));
+        break;
+      }
       case 'wbs-reconnect': WBS.reconnect(); break;
       case 'wbs-sync': WBS.syncNow(); break;
       case 'wbs-disconnect': WBS.disconnect(); break;
@@ -1137,6 +1335,14 @@
     }
     if (el.id === 'wbs-hide-done') { ui.wbsHideDone = el.checked; render(); return; }
     if (el.id === 'wbs-file' && el.files[0]) { WBS.importFile(el.files[0]); return; }
+    if (el.dataset.teamFile !== undefined && el.files[0]) { Team.addFile(el.files[0], el.dataset.teamFile || null); return; }
+    if (el.dataset.src && el.dataset.srcField) {
+      const f = el.dataset.srcField;
+      const v = el.type === 'checkbox' ? el.checked : el.value.trim();
+      if (f === 'mode') Team.setMode(el.dataset.src, v);
+      else Store.updateSource(el.dataset.src, { [f]: v });
+      return;
+    }
     if (el.dataset.settingText !== undefined) { Store.updateSettings({ [el.dataset.settingText]: el.value.trim() }); return; }
     if (el.dataset.wbsSetting) {
       const k = el.dataset.wbsSetting;
@@ -1222,11 +1428,15 @@
   document.addEventListener('focusout', () => {
     if (ui.renderPending) setTimeout(() => { if (ui.renderPending) { ui.renderPending = false; softRender(); } }, 50);
   });
-  Store.onChange((st, meta) => ((meta && /^wbs/.test(meta.source || '')) ? softRender() : render()));
+  Store.onChange((st, meta) => ((meta && /^(wbs|team)/.test(meta.source || '')) ? softRender() : render()));
   if (WBS) { WBS.onChange(softRender); WBS.boot(); }
+  if (Team) {
+    Team.onChange(softRender);
+    Team.boot();
+  }
   // 日付が変わったら（翌朝タブを開いたままでも）定例生成と再計算
   setInterval(() => { if (Core.todayISO() !== ui.today) boot(); }, 60000);
   boot();
 
-  root.UI = { render, ui };
+  root.UI = { render, ui, toast };
 })(window);
