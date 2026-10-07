@@ -120,7 +120,9 @@
   let storageOK = true;
   try {
     const raw = localStorage.getItem(KEY);
-    state = raw ? normalize(JSON.parse(raw)) : sampleState(Core.todayISO());
+    const saved = raw ? JSON.parse(raw) : null;
+    // 旧バージョンのサンプルのままなら、WBS 項目入りの新しいサンプルに入れ替える
+    state = saved && !(saved.sample && (saved.version || 1) < 2) ? normalize(saved) : sampleState(Core.todayISO());
   } catch (e) {
     storageOK = false;
     state = sampleState(Core.todayISO());
